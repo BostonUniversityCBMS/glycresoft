@@ -2,8 +2,10 @@ from collections import defaultdict
 from uuid import uuid4
 
 from ms_deisotope.output.db import (
-    Base, DeconvolutedPeak, MSScan, Mass, HasUniqueName,
+    Base, DeconvolutedPeak, MSScan, Mass, HasUniqueName, PrecursorInformation,
     SampleRun, DatabaseScanDeserializer, DatabaseBoundOperation)
+
+from glycan_profiling.task import TaskBase
 
 from .analysis import Analysis
 from .chromatogram import (
@@ -19,7 +21,7 @@ from .identification import (
     Glycopeptide)
 
 
-class AnalysisSerializer(DatabaseBoundOperation):
+class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
     def __init__(self, connection, sample_run_id, analysis_name, analysis_id=None):
         DatabaseBoundOperation.__init__(self, connection)
         session = self.session
@@ -136,9 +138,12 @@ class AnalysisSerializer(DatabaseBoundOperation):
         return result
 
     def save_glycopeptide_identification(self, identification, commit=False):
-        chromatogram_solution = self.save_chromatogram_solution(
-            identification.chromatogram, commit=False)
-        chromatogram_solution_id = chromatogram_solution.id
+        if identification.chromatogram is not None:
+            chromatogram_solution = self.save_chromatogram_solution(
+                identification.chromatogram, commit=False)
+            chromatogram_solution_id = chromatogram_solution.id
+        else:
+            chromatogram_solution_id = None
         cluster = GlycopeptideSpectrumCluster.serialize(
             identification, self.session, self._scan_id_map,
             analysis_id=self.analysis_id)
@@ -151,13 +156,26 @@ class AnalysisSerializer(DatabaseBoundOperation):
 
     def save_glycopeptide_identification_set(self, identification_set, commit=False):
         cache = defaultdict(list)
+        no_chromatograms = []
         out = []
+        n = len(identification_set)
+        i = 0
         for case in identification_set:
+            i += 1
+            if i % 100 == 0:
+                self.log("%0.2f%% glycopeptides saved. (%d/%d), %r" % (i * 100. / n, i, n, case))
             saved = self.save_glycopeptide_identification(case)
-            cache[case.chromatogram].append(saved)
+            if case.chromatogram is not None:
+                cache[case.chromatogram].append(saved)
+            else:
+                no_chromatograms.append(saved)
             out.append(saved)
         for chromatogram, members in cache.items():
-            AmbiguousGlycopeptideGroup.serialize(members, self.session, analysis_id=self.analysis_id)
+            AmbiguousGlycopeptideGroup.serialize(
+                members, self.session, analysis_id=self.analysis_id)
+        for case in no_chromatograms:
+            AmbiguousGlycopeptideGroup.serialize(
+                [case], self.session, analysis_id=self.analysis_id)
         return out
 
     def commit(self):
@@ -167,6 +185,9 @@ class AnalysisSerializer(DatabaseBoundOperation):
 class AnalysisDeserializer(DatabaseBoundOperation):
     def __init__(self, connection, analysis_name=None, analysis_id=None):
         DatabaseBoundOperation.__init__(self, connection)
+
+        if analysis_name is analysis_id is None:
+            analysis_id = 1
 
         self._analysis = None
         self._analysis_id = analysis_id
@@ -201,15 +222,17 @@ class AnalysisDeserializer(DatabaseBoundOperation):
         return self._analysis_name
 
     def load_unidentified_chromatograms(self):
+        from glycan_profiling.chromatogram_tree import ChromatogramFilter
         q = self.query(UnidentifiedChromatogram).filter(
             UnidentifiedChromatogram.analysis_id == self.analysis_id).yield_per(100)
-        chroma = [c.convert() for c in q]
+        chroma = ChromatogramFilter([c.convert() for c in q])
         return chroma
 
     def load_glycan_composition_chromatograms(self):
+        from glycan_profiling.chromatogram_tree import ChromatogramFilter
         q = self.query(GlycanCompositionChromatogram).filter(
             GlycanCompositionChromatogram.analysis_id == self.analysis_id).yield_per(100)
-        chroma = [c.convert() for c in q]
+        chroma = ChromatogramFilter([c.convert() for c in q])
         return chroma
 
     def load_identified_glycopeptides_for_protein(self, protein_id):

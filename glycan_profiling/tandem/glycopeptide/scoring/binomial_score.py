@@ -20,11 +20,16 @@ from ...spectrum_annotation import annotate_matched_deconvoluted_peaks
 from .fragment_match_map import FragmentMatchMap
 
 
-@memoize(1000000000)
+@memoize(100000000000)
+def binomial_pmf(n, i, p):
+    return comb(n, i, exact=True) * (p ** i) * ((1 - p) ** (n - i))
+
+
+@memoize(100000000000)
 def binomial_tail_probability(n, k, p):
     total = 0.0
     for i in range(k, n):
-        v = comb(n, i, exact=True) * (p ** i) * ((1 - p) ** (n - i))
+        v = binomial_pmf(n, i, p)
         if np.isnan(v):
             continue
         total += v
@@ -60,9 +65,28 @@ def medians(array):
     return m1, m2, m3, m4
 
 
-def binomial_intensity(peak_list, matched_peaks, total_product_ion_count):
-    if len(matched_peaks) == 0:
-        return np.exp(0)
+def _counting_tiers(peak_list, matched_peaks, total_product_ion_count):
+    intensity_list = np.array([p.intensity for p in peak_list])
+    m1, m2, m3, m4 = medians(intensity_list)
+
+    matched_intensities = np.array(
+        [p.intensity for match, p in matched_peaks.items()])
+    counts = dict()
+    next_count = (matched_intensities > m1).sum()
+    counts[1] = next_count
+
+    next_count = (matched_intensities > m2).sum()
+    counts[2] = next_count
+
+    next_count = (matched_intensities > m3).sum()
+    counts[3] = next_count
+
+    next_count = (matched_intensities > m4).sum()
+    counts[4] = next_count
+    return counts
+
+
+def _intensity_tiers(peak_list, matched_peaks, total_product_ion_count):
     intensity_list = np.array([p.intensity for p in peak_list])
     m1, m2, m3, m4 = medians(intensity_list)
 
@@ -84,6 +108,38 @@ def binomial_intensity(peak_list, matched_peaks, total_product_ion_count):
 
     next_count = (matched_intensities > m4).sum()
     counts[4] = binomial_tail_probability(last_count, next_count, 0.5)
+    return counts
+
+
+def _score_tiers(peak_list, matched_peaks, total_product_ion_count):
+    intensity_list = np.array([p.score for p in peak_list])
+    m1, m2, m3, m4 = medians(intensity_list)
+
+    matched_intensities = np.array(
+        [p.score for match, p in matched_peaks.items()])
+    counts = dict()
+    last_count = total_product_ion_count
+    next_count = (matched_intensities > m1).sum()
+    counts[1] = binomial_tail_probability(last_count, next_count, 0.5)
+    last_count = next_count
+
+    next_count = (matched_intensities > m2).sum()
+    counts[2] = binomial_tail_probability(last_count, next_count, 0.5)
+    last_count = next_count
+
+    next_count = (matched_intensities > m3).sum()
+    counts[3] = binomial_tail_probability(last_count, next_count, 0.5)
+    last_count = next_count
+
+    next_count = (matched_intensities > m4).sum()
+    counts[4] = binomial_tail_probability(last_count, next_count, 0.5)
+    return counts
+
+
+def binomial_intensity(peak_list, matched_peaks, total_product_ion_count):
+    if len(matched_peaks) == 0:
+        return np.exp(0)
+    counts = _intensity_tiers(peak_list, matched_peaks, total_product_ion_count)
 
     prod = 0
     for v in counts.values():
@@ -94,7 +150,7 @@ def binomial_intensity(peak_list, matched_peaks, total_product_ion_count):
 
 
 def calculate_precursor_mass(spectrum_match):
-    precursor_mass = spectrum_match.target.peptide_composition().mass
+    precursor_mass = spectrum_match.target.total_composition().mass
     return precursor_mass
 
 
@@ -106,18 +162,18 @@ class BinomialSpectrumMatcher(SpectrumMatcherBase):
         self._score = None
         self.solution_map = FragmentMatchMap()
         self.n_theoretical = 0
+        self._backbone_mass_series = []
 
     def match(self, error_tolerance=2e-5):
         n_theoretical = 0
         solution_map = FragmentMatchMap()
         spectrum = self.spectrum
+        backbone_mass_series = []
         for frag in self.target.glycan_fragments(
                 all_series=False, allow_ambiguous=False,
                 include_large_glycan_fragments=False,
                 maximum_fragment_size=4):
-            peak = spectrum.has_peak(frag.mass, error_tolerance)
-            # n_theoretical += 1
-            if peak:
+            for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
                 solution_map.add(peak, frag)
                 try:
                     self._sanitized_spectrum.remove(peak)
@@ -125,23 +181,23 @@ class BinomialSpectrumMatcher(SpectrumMatcherBase):
                     continue
         for frags in self.target.get_fragments('b'):
             for frag in frags:
+                backbone_mass_series.append(frag.mass)
                 n_theoretical += 1
-                peak = spectrum.has_peak(frag.mass, error_tolerance)
-                if peak:
+                for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
                     solution_map.add(peak, frag)
+                self._backbone_mass_series
         for frags in self.target.get_fragments('y'):
+            backbone_mass_series.append(frag.mass)
             for frag in frags:
                 n_theoretical += 1
-                peak = spectrum.has_peak(frag.mass, error_tolerance)
-                if peak:
+                for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
                     solution_map.add(peak, frag)
         for frag in self.target.stub_fragments(extended=True):
-            # n_theoretical += 1
-            peak = spectrum.has_peak(frag.mass, error_tolerance)
-            if peak:
-                solution_map.add(peak, frag)
+            for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
+                    solution_map.add(peak, frag)
         self.solution_map = solution_map
         self.n_theoretical = n_theoretical
+        self._backbone_mass_series = backbone_mass_series
         return solution_map
 
     def _sanitize_solution_map(self):
@@ -151,13 +207,25 @@ class BinomialSpectrumMatcher(SpectrumMatcherBase):
                 san.add(pair)
         return san
 
+    def _compute_average_window_size(self, match_tolerance=2e-5):
+        # window_sizes = [
+        #     match_tolerance * frag.mass * 2
+        #     for frag in self._backbone_mass_series
+        # ]
+
+        # average_window_size = sum(window_sizes) / len(window_sizes)
+        average_window_size = (
+            (self.target.peptide_composition(
+            ).mass) / 3.) * match_tolerance * 2
+        return average_window_size
+
     def _fragment_matched_binomial(self, match_tolerance=2e-5):
         precursor_mass = calculate_precursor_mass(self)
 
         fragment_match_component = binomial_fragments_matched(
             self.n_theoretical,
             len(self._sanitize_solution_map()),
-            match_tolerance,
+            self._compute_average_window_size(match_tolerance),
             precursor_mass
         )
         return fragment_match_component
@@ -182,8 +250,8 @@ class BinomialSpectrumMatcher(SpectrumMatcherBase):
 
         fragment_match_component = binomial_fragments_matched(
             self.n_theoretical,
-            n_matched,
-            match_tolerance,
+            len(self._sanitize_solution_map()),
+            self._compute_average_window_size(match_tolerance),
             precursor_mass
         )
 
@@ -209,9 +277,9 @@ class BinomialSpectrumMatcher(SpectrumMatcherBase):
         self._score = score
         return score
 
-    def annotate(self, ax=None, **kwargs):
+    def annotate(self, ax=None, label_font_size=12, **kwargs):
         ax = draw_peaklist(self.spectrum, alpha=0.3, color='grey', ax=ax, **kwargs)
         draw_peaklist(self._sanitized_spectrum, color='grey', ax=ax, alpha=0.5, **kwargs)
-        annotate_matched_deconvoluted_peaks(self.solution_map.items(), ax)
+        annotate_matched_deconvoluted_peaks(self.solution_map.items(), ax, fontsize=label_font_size)
         return draw_peaklist(
             sorted(self.solution_map.values(), key=lambda x: x.neutral_mass), ax=ax, color='red', **kwargs)

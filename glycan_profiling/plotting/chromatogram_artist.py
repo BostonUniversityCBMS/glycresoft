@@ -9,7 +9,7 @@ import glypy
 from .glycan_visual_classification import (
     NGlycanCompositionColorizer, NGlycanCompositionOrderer,
     GlycanLabelTransformer)
-from ..chromatogram_tree import ChromatogramInterface, get_chromatogram
+from ..chromatogram_tree import get_chromatogram
 
 
 def split_charge_states(chromatogram):
@@ -121,13 +121,15 @@ class ChromatogramArtist(ArtistBase):
         if ax is None:
             fig, ax = plt.subplots(1)
 
-        chromatograms = self._resolve_chromatograms_from_argument(chromatograms)
-        chromatograms = [get_chromatogram(c) for c in chromatograms]
+        if len(chromatograms) > 0:
+            chromatograms = self._resolve_chromatograms_from_argument(chromatograms)
+            chromatograms = [get_chromatogram(c) for c in chromatograms]
+        else:
+            chromatograms = []
         self.chromatograms = chromatograms
         self.minimum_ident_time = float("inf")
         self.maximum_ident_time = 0
         self.maximum_intensity = 0
-        self.scan_id_to_intensity = {}
         self.ax = ax
         self.default_colorizer = colorizer
         self.legend = None
@@ -141,7 +143,7 @@ class ChromatogramArtist(ArtistBase):
             chromatograms = [chromatograms]
         return chromatograms
 
-    def draw_generic_chromatogram(self, label, rt, heights, color, fill=False):
+    def draw_generic_chromatogram(self, label, rt, heights, color, fill=False, label_font_size=10):
         if fill:
             s = self.ax.fill_between(
                 rt,
@@ -167,9 +169,9 @@ class ChromatogramArtist(ArtistBase):
         rt_apex = rt[apex_ind]
 
         if label is not None:
-            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=10)
+            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=label_font_size)
 
-    def draw_group(self, label, rt, heights, color, label_peak=True, chromatogram=None):
+    def draw_group(self, label, rt, heights, color, label_peak=True, chromatogram=None, label_font_size=10):
         if chromatogram is not None:
             try:
                 key = str(chromatogram.id)
@@ -198,20 +200,15 @@ class ChromatogramArtist(ArtistBase):
         rt_apex = rt[apex_ind]
 
         if label is not None and label_peak:
-            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=10)
+            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=label_font_size)
 
-    def process_group(self, composition, chromatogram, label_function=None):
+    def process_group(self, composition, chromatogram, label_function=None, **kwargs):
         if label_function is None:
             label_function = self.default_label_function
-        part = slice(None)
-        peaks = chromatogram.peaks[part]
-        ids = chromatogram.scan_ids[part]
 
         color = self.default_colorizer(chromatogram)
 
         rt, heights = chromatogram.as_arrays()
-
-        self.scan_id_to_intensity = dict(zip(ids, heights))
 
         self.maximum_ident_time = max(max(rt), self.maximum_ident_time)
         self.minimum_ident_time = min(min(rt), self.minimum_ident_time)
@@ -219,14 +216,14 @@ class ChromatogramArtist(ArtistBase):
         self.maximum_intensity = max(max(heights), self.maximum_intensity)
 
         label = label_function(
-            chromatogram, rt=rt, heights=heights, peaks=peaks)
+            chromatogram, rt=rt, heights=heights, peaks=None)
         if isinstance(label, basestring):
             label = label
             label_peak = True
         else:
             label, label_peak = label
 
-        self.draw_group(label, rt, heights, color, label_peak, chromatogram)
+        self.draw_group(label, rt, heights, color, label_peak, chromatogram, **kwargs)
 
     def layout_axes(self, legend=True, axis_font_size=18, axis_label_font_size=24):
         self.ax.set_xlim(self.minimum_ident_time - 0.02,
@@ -244,7 +241,7 @@ class ChromatogramArtist(ArtistBase):
         [t.set(fontsize=axis_font_size) for t in self.ax.get_yticklabels()]
 
     def draw(self, filter_function=lambda x, y: False, label_function=None,
-             legend=True):
+             legend=True, label_font_size=10):
         if label_function is None:
             label_function = self.default_label_function
         for chroma in self.chromatograms:
@@ -259,7 +256,7 @@ class ChromatogramArtist(ArtistBase):
             if filter_function(gc, chroma):
                 continue
 
-            self.process_group(composition, chroma, label_function)
+            self.process_group(composition, chroma, label_function, label_font_size=label_font_size)
         self.layout_axes(legend=legend)
         return self
 
@@ -269,7 +266,7 @@ class SmoothingChromatogramArtist(ChromatogramArtist):
         super(SmoothingChromatogramArtist, self).__init__(chromatograms, ax=ax, colorizer=colorizer)
         self.smoothing_factor = smoothing_factor
 
-    def draw_group(self, label, rt, heights, color, label_peak=True, chromatogram=None):
+    def draw_group(self, label, rt, heights, color, label_peak=True, chromatogram=None, label_font_size=10):
         if chromatogram is not None:
             try:
                 key = str(chromatogram.id)
@@ -297,9 +294,9 @@ class SmoothingChromatogramArtist(ChromatogramArtist):
         rt_apex = rt[apex_ind]
 
         if label is not None and label_peak:
-            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=10)
+            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=label_font_size)
 
-    def draw_generic_chromatogram(self, label, rt, heights, color, fill=False):
+    def draw_generic_chromatogram(self, label, rt, heights, color, fill=False, label_font_size=10):
         heights = gaussian_filter1d(heights, self.smoothing_factor)
         if fill:
             s = self.ax.fill_between(
@@ -325,19 +322,19 @@ class SmoothingChromatogramArtist(ChromatogramArtist):
         rt_apex = rt[apex_ind]
 
         if label is not None:
-            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=10)
+            self.ax.text(rt_apex, apex + 1200, label, ha='center', fontsize=label_font_size)
 
 
 class ChargeSeparatingChromatogramArtist(ChromatogramArtist):
     default_label_function = staticmethod(label_include_charges)
 
-    def process_group(self, composition, chroma, label_function=None):
+    def process_group(self, composition, chroma, label_function=None, **kwargs):
         if label_function is None:
             label_function = self.default_label_function
         charge_state_map = split_charge_states(chroma)
         for charge_state, component in charge_state_map.items():
             super(ChargeSeparatingChromatogramArtist, self).process_group(
-                composition, component, label_function=label_function)
+                composition, component, label_function=label_function, **kwargs)
 
 
 class ChargeSeparatingSmoothingChromatogramArtist(

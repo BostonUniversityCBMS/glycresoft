@@ -2,11 +2,38 @@ from ms_deisotope.peak_dependency_network.intervals import Interval, IntervalTre
 
 from glycan_profiling.task import TaskBase
 
-from .chromatogram import (
-    Chromatogram, DuplicateNodeError)
+from .chromatogram import (Chromatogram)
 
 
-class ChromatogramForest(object):
+class ChromatogramForest(TaskBase):
+    """An an algorithm for aggregating chromatograms from peaks of close mass
+    weighted by intensity.
+
+    This algorithm assumes that mass accuracy is correlated with intensity, so
+    the most intense peaks should most accurately reflect their true neutral mass.
+    The expected input is a list of (scan id, peak) pairs. This list is sorted by
+    descending peak intensity. For each pair, using binary search, locate the nearest
+    existing chromatogram in :attr:`chromatograms`. If the nearest chromatogram is within
+    :attr:`error_tolerance` ppm of the peak's neutral mass, add this peak to that
+    chromatogram, otherwise create a new chromatogram containing this peak and insert
+    it into :attr:`chromatograms` while preserving the overall sortedness. This algorithm
+    is carried out by :meth:`aggregate_unmatched_peaks`
+
+    This process may produce chromatograms with large gaps in them, which
+    may or may not be acceptable. To break gapped chromatograms into separate
+    entities, the :class:`ChromatogramFilter` type has a method :meth:`split_sparse`.
+
+    Attributes
+    ----------
+    chromatograms : list of Chromatogram
+        A list of growing Chromatogram objects, ordered by neutral mass
+    count : int
+        The number of peaks accumulated
+    error_tolerance : float
+        The mass error tolerance between peaks and possible chromatograms (in ppm)
+    scan_id_to_rt : callable
+        A callable object to convert scan ids to retention time.
+    """
     def __init__(self, chromatograms=None, error_tolerance=1e-5, scan_id_to_rt=lambda x: x):
         if chromatograms is None:
             chromatograms = []
@@ -14,7 +41,6 @@ class ChromatogramForest(object):
         self.error_tolerance = error_tolerance
         self.scan_id_to_rt = scan_id_to_rt
         self.count = 0
-        self.verbose = False
 
     def __len__(self):
         return len(self.chromatograms)
@@ -77,16 +103,20 @@ class ChromatogramForest(object):
                     new_index = index[0]
             self.chromatograms.insert(new_index, chromatogram)
 
-    def aggregate_unmatched_peaks(self, scan_id_peaks_list, minimum_mass=300, minimum_intensity=1000.):
+    def aggregate_unmatched_peaks(self, *args, **kwargs):
+        import warnings
+        warnings.warn("Instead of calling aggregate_unmatched_peaks, call aggregate_peaks", stacklevel=2)
+        self.aggregate_peaks(*args, **kwargs)
+
+    def aggregate_peaks(self, scan_id_peaks_list, minimum_mass=300, minimum_intensity=1000.):
         unmatched = sorted(scan_id_peaks_list, key=lambda x: x[1].intensity, reverse=True)
         for scan_id, peak in unmatched:
             if peak.neutral_mass < minimum_mass or peak.intensity < minimum_intensity:
                 continue
             self.handle_peak(scan_id, peak)
-            self.verbose = False
 
 
-class ChromatogramMerger(object):
+class ChromatogramMerger(TaskBase):
     def __init__(self, chromatograms=None, error_tolerance=1e-5):
         if chromatograms is None:
             chromatograms = []
@@ -126,7 +156,8 @@ class ChromatogramMerger(object):
         return has_merged
 
     def find_insertion_point(self, new_chromatogram):
-        return binary_search_exact(self.chromatograms, new_chromatogram.neutral_mass)
+        return binary_search_exact(
+            self.chromatograms, new_chromatogram.neutral_mass)
 
     def handle_new_chromatogram(self, new_chromatogram):
         if len(self) == 0:
@@ -226,7 +257,7 @@ def binary_search_with_flag(array, mass, error_tolerance=1e-5):
         lo = 0
         n = hi = len(array)
         while hi != lo:
-            mid = (hi + lo) / 2
+            mid = (hi + lo) // 2
             x = array[mid]
             err = (x.neutral_mass - mass) / mass
             if abs(err) <= error_tolerance:
@@ -267,7 +298,7 @@ def binary_search_exact(array, mass):
     lo = 0
     hi = len(array)
     while hi != lo:
-        mid = (hi + lo) / 2
+        mid = (hi + lo) // 2
         x = array[mid]
         err = (x.neutral_mass - mass)
         if err == 0:
@@ -284,7 +315,7 @@ def is_sorted(mass_list):
     i = 0
     for a, b in zip(mass_list[:-1], mass_list[1:]):
         if not a.neutral_mass <= b.neutral_mass:
-            print a.neutral_mass, b.neutral_mass, i
+            print(a.neutral_mass, b.neutral_mass, i)
             raise ValueError("Not sorted")
             return False
         i += 1
@@ -296,7 +327,7 @@ def is_sparse(mass_list):
     for a, b in zip(mass_list[:-1], mass_list[1:]):
         err = (a.neutral_mass - b.neutral_mass) / b.neutral_mass
         if abs(err) < 1e-5 and a.composition is None:
-            print a.neutral_mass, b.neutral_mass, err, i
+            print(a.neutral_mass, b.neutral_mass, err, i)
             raise ValueError("Not sparse")
             return False
         i += 1
@@ -311,7 +342,7 @@ def is_sparse_and_disjoint(chromatogram_list):
         b = chromatogram_list[i + 1]
         err = (a.neutral_mass - b.neutral_mass) / b.neutral_mass
         if abs(err) < 1e-5 and a.composition is None and a.overlaps_in_time(b):
-            print a.neutral_mass, b.neutral_mass, err, i
+            print(a.neutral_mass, b.neutral_mass, err, i)
             raise ValueError("Not sparse")
             return False
     return True

@@ -1,11 +1,17 @@
 from multiprocessing import Queue, Event
+
+from glycan_profiling.serialize import func
 from glycan_profiling.serialize.hypothesis.peptide import Peptide, Protein
 
-from .proteomics.peptide_permutation import ProteinDigestor
+from glycopeptidepy.algorithm import reverse_preserve_sequon
+
+from .proteomics.peptide_permutation import (ProteinDigestor, MultipleProcessProteinDigestor)
 from .proteomics.fasta import ProteinFastaFileParser
 from .common import (
-    GlycopeptideHypothesisSerializerBase, DatabaseBoundOperation,
-    PeptideGlycosylator, PeptideGlycosylatingProcess)
+    GlycopeptideHypothesisSerializerBase,
+    PeptideGlycosylator, PeptideGlycosylatingProcess,
+    NonSavingPeptideGlycosylatingProcess,
+    MultipleProcessPeptideGlycosylator)
 
 
 class FastaGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializerBase):
@@ -19,19 +25,29 @@ class FastaGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializerBase
         self.variable_modifications = variable_modifications
         self.max_missed_cleavages = max_missed_cleavages
         self.max_glycosylation_events = max_glycosylation_events
-        self.set_parameters({
+
+        params = {
             "fasta_file": fasta_file,
-            "enzymes": [protease],
+            "enzymes": [protease] if isinstance(protease, basestring) else list(protease),
             "constant_modifications": constant_modifications,
             "variable_modifications": variable_modifications,
             "max_missed_cleavages": max_missed_cleavages,
             "max_glycosylation_events": max_glycosylation_events
-        })
+        }
+
+        # self.log("Setting Parameters (%r)" % (params,))
+        self.set_parameters(params)
 
     def extract_proteins(self):
+        i = 0
         for protein in ProteinFastaFileParser(self.fasta_file):
             protein.hypothesis_id = self.hypothesis_id
             self.session.add(protein)
+            i += 1
+            if i % 10000 == 0:
+                self.log("%d Proteins Extracted" % (i,))
+                self.session.commit()
+
         self.session.commit()
 
     def protein_ids(self):
@@ -44,18 +60,27 @@ class FastaGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializerBase
         digestor = ProteinDigestor(
             self.protease, self.constant_modifications, self.variable_modifications,
             self.max_missed_cleavages)
-        for protein_id in self.protein_ids():
+        i = 0
+        j = 0
+        protein_ids = self.protein_ids()
+        n = len(protein_ids)
+        interval = min(n / 10., 100000)
+        acc = []
+        for protein_id in protein_ids:
+            i += 1
             protein = self.query(Protein).get(protein_id)
-            acc = []
+            if i % interval == 0:
+                self.log("%0.3f%% Complete (%d/%d). %d Peptides Produced." % (i * 100. / n, i, n, j))
             for peptide in digestor.process_protein(protein):
                 acc.append(peptide)
+                j += 1
                 if len(acc) > 100000:
                     self.session.bulk_save_objects(acc)
                     self.session.commit()
                     acc = []
-            self.session.bulk_save_objects(acc)
-            self.session.commit()
-            acc = []
+        self.session.bulk_save_objects(acc)
+        self.session.commit()
+        acc = []
 
     def glycosylate_peptides(self):
         glycosylator = PeptideGlycosylator(self.session, self.hypothesis_id)
@@ -82,6 +107,7 @@ class FastaGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializerBase
         self.combinate_glycans(self.max_glycosylation_events)
         self.log("Building Glycopeptides")
         self.glycosylate_peptides()
+        self._sql_analyze_database()
         self._count_produced_glycopeptides()
         self.log("Done")
 
@@ -96,29 +122,52 @@ class MultipleProcessFastaGlycopeptideHypothesisSerializer(FastaGlycopeptideHypo
             max_missed_cleavages, max_glycosylation_events)
         self.n_processes = n_processes
 
+    def digest_proteins(self):
+        digestor = ProteinDigestor(
+            self.protease, self.constant_modifications, self.variable_modifications,
+            self.max_missed_cleavages)
+        task = MultipleProcessProteinDigestor(
+            self._original_connection,
+            self.hypothesis_id,
+            self.protein_ids(),
+            digestor, n_processes=self.n_processes)
+        task.run()
+        n_peptides = self.query(func.count(Peptide.id)).filter(
+            Peptide.hypothesis_id == self.hypothesis_id).scalar()
+        self.log("%d Base Peptides Produced" % (n_peptides,))
+
+    def _spawn_glycosylator(self, input_queue, done_event):
+        return PeptideGlycosylatingProcess(
+            self._original_connection, self.hypothesis_id, input_queue,
+            chunk_size=3500, done_event=done_event)
+
     def glycosylate_peptides(self):
-        input_queue = Queue(100)
-        done_event = Event()
-        processes = [
-            PeptideGlycosylatingProcess(
-                self._original_connection, self.hypothesis_id, input_queue,
-                chunk_size=15000, done_event=done_event) for i in range(self.n_processes)
-        ]
-        peptide_ids = self.peptide_ids()
-        n = len(peptide_ids)
-        i = 0
-        chunk_size = 50
-        for process in processes:
-            input_queue.put(peptide_ids[i:(i + chunk_size)])
-            i += chunk_size
-            process.start()
+        dispatcher = MultipleProcessPeptideGlycosylator(
+            self._original_connection, self.hypothesis_id,
+            n_processes=self.n_processes)
+        dispatcher.process(self.peptide_ids())
 
-        while i < n:
-            input_queue.put(peptide_ids[i:(i + chunk_size)])
-            i += chunk_size
-            self.log("... Dealt Peptides %d-%d %0.2f%%" % (i - chunk_size, i, (i / float(n)) * 100))
 
-        self.log("... All Peptides Dealt")
-        done_event.set()
-        for process in processes:
-            process.join()
+_MPFGHS = MultipleProcessFastaGlycopeptideHypothesisSerializer
+
+
+class ReversingMultipleProcessFastaGlycopeptideHypothesisSerializer(_MPFGHS):
+    def extract_proteins(self):
+            i = 0
+            for protein in ProteinFastaFileParser(self.fasta_file):
+                protein.protein_sequence = str(reverse_preserve_sequon(protein.protein_sequence))
+                protein.hypothesis_id = self.hypothesis_id
+                self.session.add(protein)
+                i += 1
+                if i % 10000 == 0:
+                    self.log("%d Proteins Extracted" % (i,))
+                    self.session.commit()
+
+            self.session.commit()
+
+
+class NonSavingMultipleProcessFastaGlycopeptideHypothesisSerializer(_MPFGHS):
+    def _spawn_glycosylator(self, input_queue, done_event):
+        return NonSavingPeptideGlycosylatingProcess(
+            self._original_connection, self.hypothesis_id, input_queue,
+            chunk_size=3500, done_event=done_event)

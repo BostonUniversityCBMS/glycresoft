@@ -66,7 +66,7 @@ class Parser(MzIdentML):
     def _recursive_populate(self, element, info, kwargs):
         for child in element.iterchildren():
             cname = _local_name(child)
-            if cname in {'cvParam', 'userParam'}:
+            if cname in ('cvParam', 'userParam'):
                 self._insert_param(info, child, **kwargs)
             else:
                 if cname not in self.schema_info['lists']:
@@ -78,9 +78,12 @@ class Parser(MzIdentML):
     def _convert_values(self, element, info, kwargs):
         converters = self._converters
         for k, v in info.items():
-            for t, a in converters.items():
-                if (_local_name(element), k) in self.schema_info[t]:
-                    info[k] = a(v)
+            try:
+                for t, a in converters.items():
+                    if (_local_name(element), k) in self.schema_info[t]:
+                        info[k] = a(v)
+            except KeyError:
+                continue
 
     def _populate_references(self, element, info, kwargs):
         info = MultipleProteinInfoDict(info)

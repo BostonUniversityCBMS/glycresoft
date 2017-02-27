@@ -1,8 +1,11 @@
+import os
 import re
+import operator
 import logging
 from collections import defaultdict
 
 from glycopeptidepy.structure import sequence, modification, residue
+from glycopeptidepy.enzyme import expasy_rules
 from glypy.composition import formula
 
 from glycan_profiling.serialize import (
@@ -10,11 +13,11 @@ from glycan_profiling.serialize import (
 
 from glycan_profiling.task import TaskBase
 
-from .enzyme import expasy_rules
 from .mzid_parser import Parser
 from .peptide_permutation import ProteinDigestor
 from .remove_duplicate_peptides import DeduplicatePeptides
 from .share_peptides import PeptideSharer
+from .fasta import ProteinSequenceListResolver
 
 try:
     basestring
@@ -30,7 +33,25 @@ Modification = modification.Modification
 ModificationNameResolutionError = modification.ModificationNameResolutionError
 
 
-PROTEOMICS_SCORE = ["PEAKS:peptideScore", "mascot:score", "PEAKS:proteinScore"]
+PROTEOMICS_SCORE = {
+    "PEAKS:peptideScore": 'greater',
+    "mascot:score": 'greater',
+    "PEAKS:proteinScore": 'greater',
+    "MS-GF:EValue": 'smaller'
+}
+
+
+def score_comparator(score_type):
+    try:
+        preference = PROTEOMICS_SCORE[score_type]
+        if preference == "smaller":
+            return operator.lt
+        else:
+            return operator.gt
+    except KeyError:
+        raise KeyError("Don't know how to compare score of type %r" % score_type)
+
+
 WHITELIST_GLYCOSITE_PTMS = [Modification("Deamidation"), Modification("HexNAc")]
 
 
@@ -38,6 +59,29 @@ class allset(object):
 
     def __contains__(self, x):
         return True
+
+
+def resolve_database_url(url):
+    if url.startswith("file://"):
+        path = url.replace("file://", "")
+        while path.startswith("/") and len(path) > 0:
+            path = path[1:]
+        if os.path.exists(path):
+            if os.path.isfile(path):
+                return path
+            else:
+                raise IOError("File URI %r points to a directory" % url)
+        else:
+            raise IOError("File URI %r does not exist on local system" % url)
+    elif url.startswith("http"):
+        return url
+    elif os.path.exists(url):
+        if os.path.isfile(url):
+            return url
+        else:
+            raise IOError("File path %r points to a directory" % url)
+    else:
+        raise IOError("Cannot resolve URL %r" % url)
 
 
 def protein_names(mzid_path, pattern=r'.*'):
@@ -58,6 +102,16 @@ def parent_sequence_aware_n_glycan_sequon_sites(peptide, protein):
     return list(sites)
 
 
+def o_glycan_sequon_sites(peptide, protein=None):
+    sites = sequence.find_o_glycosylation_sequons(peptide.modified_peptide_sequence)
+    return sites
+
+
+def gag_sequon_sites(peptide, protein=None):
+    sites = sequence.find_glycosaminoglycan_sequons(peptide.modified_peptide_sequence)
+    return sites
+
+
 def remove_peptide_sequence_alterations(base_sequence, insert_sites, delete_sites):
     """
     Remove all the sequence insertions and deletions in order to reconstruct the
@@ -67,7 +121,7 @@ def remove_peptide_sequence_alterations(base_sequence, insert_sites, delete_site
     ----------
     base_sequence : str
         The peptide sequence string which contains a combination
-        of insertion and deletions
+        of insertion and deletions.
     insert_sites : list
         A list of (position, None) pairs indicating the position of
         an amino acid insertion to be removed.
@@ -169,10 +223,11 @@ class PeptideCollection(object):
         self.protein_set = protein_set
 
     def add(self, peptide):
+        comparator = score_comparator(peptide.peptide_score_type)
         group = self.store[peptide.modified_peptide_sequence]
         if group:
             first = group.first()
-            if first.peptide_score < peptide.peptide_score:
+            if comparator(peptide.peptide_score, first.peptide_score):
                 group.clear()
                 group[peptide.protein_id] = peptide
                 self.store[peptide.modified_peptide_sequence] = group
@@ -242,7 +297,7 @@ class PeptideIdentification(object):
                     try:
                         _name = mod["name"]
                         modification = Modification(_name)
-                    except KeyError, e:
+                    except KeyError as e:
                         if "unknown modification" in mod:
                             try:
                                 _name = mod['unknown modification']
@@ -376,19 +431,13 @@ class PeptideConverter(object):
         self.counter = 0
 
     def get_protein(self, evidence):
-        # parent_protein = self.session.query(Protein).filter(
-        #     Protein.name == evidence['accession'],
-        #     Protein.hypothesis_id == self.hypothesis_id).first()
-        # return parent_protein
         return self.protein_loader[evidence['accession']]
 
     def sequence_starts_at(self, sequence, parent_protein):
         found = parent_protein.protein_sequence.find(sequence)
         if found == -1:
-            raise ValueError("Peptide not found in Protein\n%s\n%s\n\n" % (
-                parent_protein.name, parent_protein.protein_sequence, (
-                    sequence
-                )))
+            print(len(parent_protein.protein_sequence))
+            raise ValueError("Peptide not found in Protein\n%s\n%r\n\n" % (parent_protein.name, sequence))
         return found
 
     def pack_peptide(self, peptide_ident, start, end, score, score_type, parent_protein):
@@ -407,11 +456,14 @@ class PeptideConverter(object):
             sequence_length=end - start,
             protein_id=parent_protein.id,
             hypothesis_id=self.hypothesis_id)
-        # match.protein = parent_protein
-        glycosites = parent_sequence_aware_n_glycan_sequon_sites(
+        n_glycosites = parent_sequence_aware_n_glycan_sequon_sites(
             match, parent_protein)
-        match.count_glycosylation_sites = len(glycosites)
-        match.n_glycosylation_sites = list(glycosites)
+        o_glycosites = o_glycan_sequon_sites(match, parent_protein)
+        gag_glycosites = gag_sequon_sites(match, parent_protein)
+        match.count_glycosylation_sites = len(n_glycosites) + len(o_glycosites)
+        match.n_glycosylation_sites = sorted(n_glycosites)
+        match.o_glycosylation_sites = sorted(o_glycosites)
+        match.gagylation_sites = sorted(gag_glycosites)
         return match
 
     def copy_db_peptide(self, db_peptide):
@@ -430,7 +482,9 @@ class PeptideConverter(object):
             sequence_length=db_peptide.sequence_length,
             protein_id=db_peptide.protein_id,
             hypothesis_id=db_peptide.hypothesis_id,
-            n_glycosylation_sites=db_peptide.n_glycosylation_sites)
+            n_glycosylation_sites=db_peptide.n_glycosylation_sites,
+            o_glycosylation_sites=db_peptide.o_glycosylation_sites,
+            gagylation_sites=db_peptide.gagylation_sites)
         return dup
 
     def has_occupied_glycosites(self, db_peptide):
@@ -444,6 +498,8 @@ class PeptideConverter(object):
         return len(occupied_sites) > 0
 
     def clear_sites(self, db_peptide):
+        # TODO: Make this a combinatorial generator so that it optionally clears each
+        # putative combination of glycosites across N/O forms.
         occupied_sites = []
         n_glycosylation_sites = db_peptide.n_glycosylation_sites
         peptide_obj = PeptideSequence(db_peptide.modified_peptide_sequence)
@@ -472,6 +528,8 @@ class PeptideConverter(object):
         for evidence in evidence_list:
             if "skip" in evidence:
                 continue
+            if evidence["isDecoy"]:
+                continue
 
             parent_protein = self.get_protein(evidence)
 
@@ -490,13 +548,11 @@ class PeptideConverter(object):
             self.add_to_save_queue(match)
             if self.has_occupied_glycosites(match):
                 cleared = self.clear_sites(match)
-                # match = self.pack_peptide(cleared, start, end, score, score_type, parent_protein)
                 self.add_to_save_queue(cleared)
 
     def add_to_save_queue(self, match):
         self.counter += 1
         self.peptide_grouper.add(match)
-        # self.accumulator.append(match)
         # assert abs(match.calculated_mass - match.convert().mass) < 0.01, abs(
         #     match.calculated_mass - match.convert().mass)
         if len(self.accumulator) > self.chunk_size:
@@ -514,17 +570,22 @@ class PeptideConverter(object):
 
 class Proteome(DatabaseBoundOperation, TaskBase):
     def __init__(self, mzid_path, connection, hypothesis_id, include_baseline_peptides=True,
-                 target_proteins=None):
+                 target_proteins=None, reference_fasta=None):
         DatabaseBoundOperation.__init__(self, connection)
         self.mzid_path = mzid_path
         self.hypothesis_id = hypothesis_id
-        self.parser = Parser(mzid_path, retrieve_refs=True, iterative=False, build_id_cache=True)
+        # self.parser = Parser(mzid_path, retrieve_refs=True, iterative=False, build_id_cache=True)
+        self.parser = Parser(mzid_path, retrieve_refs=True, iterative=True, use_index=True)
         self.enzymes = []
         self.constant_modifications = []
         self.modification_translation_table = {}
         self.target_proteins = target_proteins
-
+        self.reference_fasta = reference_fasta
         self.include_baseline_peptides = include_baseline_peptides
+
+        self._protein_resolver = None
+        self._ignore_protein_regex = None
+        self._used_database_path = None
 
     def load_enzyme(self):
         self.parser.reset()
@@ -532,6 +593,7 @@ class Proteome(DatabaseBoundOperation, TaskBase):
             "EnzymeName", retrieve_refs=True, iterative=True)})
 
     def load_modifications(self):
+        self.parser.reset()
         search_param_modifications = list(self.parser.iterfind(
             "ModificationParams", retrieve_refs=True, iterative=True))
         constant_modifications = []
@@ -554,13 +616,95 @@ class Proteome(DatabaseBoundOperation, TaskBase):
                     constant_modifications.append(identifier)
         self.constant_modifications = constant_modifications
 
+    def _make_protein_resolver(self):
+        if self.reference_fasta is not None:
+            self._protein_resolver = ProteinSequenceListResolver.build_from_fasta(self.reference_fasta)
+            return
+        else:
+            path = self._find_used_database()
+            if path is not None:
+                self._protein_resolver = ProteinSequenceListResolver.build_from_fasta(path)
+                return
+        raise ValueError("Cannot construct a Protein Resolver. Cannot fetch additional protein information.")
+
+    def _clear_protein_resolver(self):
+        self._protein_resolver = None
+
+    def _find_used_database(self):
+        if self._used_database_path is not None:
+            return self._used_database_path
+        self.parser.reset()
+        databases = list(self.parser.iterfind("SearchDatabase", iterative=True))
+        # use only the first database
+        if len(databases) > 1:
+            self.log("%d databases found: %r" % (len(databases), databases))
+            self.log("Using first only")
+        database = databases[0]
+        if "decoy DB accession regexp" in database:
+            self._ignore_protein_regex = re.compile(database["decoy DB accession regexp"])
+        if "FASTA format" in database.get('FileFormat', {}):
+            self.log("Database described in FASTA format")
+            db_location = database.get("location")
+            if db_location is None:
+                raise ValueError("No location present for database")
+            else:
+                try:
+                    path = resolve_database_url(db_location)
+                    with open(path, 'r') as handle:
+                        for i, line in enumerate(handle):
+                            if i > 1000:
+                                raise ValueError("No FASTA Header before thousandth line. Probably not a FASTA file")
+                            if line.startswith(">"):
+                                break
+                    self._used_database_path = path
+                    return path
+                except (IOError, ValueError):
+                    return None
+        else:
+            return None
+
+    def resolve_protein(self, name):
+        if self._protein_resolver is None:
+            self._make_protein_resolver()
+        proteins = self._protein_resolver.find(name)
+        if len(proteins) > 1:
+            self.log("Protein Name %r resolved to multiple proteins: %r. Using first only." % (name, proteins))
+        elif len(proteins) == 0:
+            raise KeyError(name)
+        return proteins[0]
+
+    def _can_ignore_protein(self, name):
+        if name not in self.target_proteins:
+            return True
+        elif (self._ignore_protein_regex is not None) and (
+                self._ignore_protein_regex.match(name)):
+            return True
+        return False
+
     def load_proteins(self):
+        self.parser.reset()
+        self._find_used_database()
         session = self.session
         protein_map = {}
+        self.parser.reset()
         for protein in self.parser.iterfind(
-                "ProteinDetectionHypothesis", retrieve_refs=True, recursive=False, iterative=True):
-            seq = protein.pop('Seq')
+                "DBSequence", retrieve_refs=True, recursive=True, iterative=True):
+            check = protein.copy()
+            seq = protein.pop('Seq', None)
             name = protein.pop('accession')
+            if seq is None:
+                print(check, seq)
+                import IPython
+                IPython.embed()
+                try:
+                    prot = self.resolve_protein(name)
+                    seq = prot.protein_sequence
+                except KeyError:
+                    if self._can_ignore_protein(name):
+                        continue
+                    else:
+                        self.log("Could not resolve protein %r" % (name,))
+
             if name in protein_map:
                 if seq != protein_map[name].protein_sequence:
                     self.log("Multiple proteins with the name %r" % name)
@@ -574,17 +718,22 @@ class Proteome(DatabaseBoundOperation, TaskBase):
                 session.add(p)
                 session.flush()
                 protein_map[name] = p
-                # self.log("... Extracted %r" % p)
             except residue.UnknownAminoAcidException:
+                self.log("Unknown Amino Acid in %r" % (name,))
+                continue
+            except Exception as e:
+                self.log("%r skipped: %r" % (name, e))
                 continue
         session.commit()
+        self._clear_protein_resolver()
 
     def load_spectrum_matches(self):
+        self.parser.reset()
         last = 0
         i = 0
         try:
             enzyme = re.compile(expasy_rules.get(self.enzymes[0]))
-        except KeyError, e:
+        except KeyError as e:
             logger.exception("Enzyme not found.", exc_info=e)
             enzyme = None
         session = self.session
@@ -619,7 +768,7 @@ class Proteome(DatabaseBoundOperation, TaskBase):
         self.load_proteins()
         self.log("... Loading Spectrum Matches")
         self.load_spectrum_matches()
-        self.log("... Sharing Common Peptides")
+        self.log("Sharing Common Peptides")
         self.remove_duplicates()
         self.share_common_peptides()
         self.remove_duplicates()
@@ -685,10 +834,10 @@ class Proteome(DatabaseBoundOperation, TaskBase):
         n = len(proteins)
         for protein in proteins:
             i += 1
-            self.log("... Accumulating Proteins for %r" % protein)
+            # self.log("... Accumulating Proteins for %r" % protein)
             sharer.find_contained_peptides(protein)
             if i % 5 == 0:
-                self.log("... %0.3f%% Done" % (i / float(n) * 100.,))
+                self.log("... %0.3f%% Done (%s)" % (i / float(n) * 100., protein.name))
 
     def remove_duplicates(self):
         DeduplicatePeptides(self._original_connection, self.hypothesis_id).run()

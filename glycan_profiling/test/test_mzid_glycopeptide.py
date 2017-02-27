@@ -12,7 +12,7 @@ from glycan_profiling import serialize
 from glycan_profiling.test.test_constrained_combinatorics import FILE_SOURCE as GLYCAN_RULE_FILE_SOURCE
 
 
-MZID_PATH = os.path.join(os.path.dirname(__name__), 'test_data', "AGP_Proteomics2.mzid")
+MZID_PATH = os.path.join(os.path.dirname(__file__), 'test_data', "AGP_Proteomics2.mzid")
 
 
 class MzIdGlycopeptideTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class MzIdGlycopeptideTests(unittest.TestCase):
             mzid_path, db_file, glycan_builder.hypothesis_id)
         glycopeptide_builder.run()
 
-        self.assertEqual(554800, glycopeptide_builder.query(Glycopeptide).count())
+        self.assertEqual(543400, glycopeptide_builder.query(Glycopeptide).count())
 
         redundancy = glycopeptide_builder.query(
             Glycopeptide.glycopeptide_sequence,

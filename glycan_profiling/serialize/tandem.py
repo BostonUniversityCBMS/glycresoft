@@ -1,7 +1,9 @@
+from weakref import WeakValueDictionary
+
 from sqlalchemy import (
     Column, Numeric, Integer, String, ForeignKey, PickleType,
     Boolean, Table)
-from sqlalchemy.orm import relationship, backref
+from sqlalchemy.orm import relationship, backref, object_session
 from sqlalchemy.ext.declarative import declared_attr
 
 from glycan_profiling.tandem.spectrum_matcher_base import (
@@ -88,6 +90,7 @@ class GlycopeptideSpectrumSolutionSet(Base, BoundToAnalysis):
             matches
         )
         inst.q_value = min(x.q_value for x in inst)
+        inst.id = self.id
         return inst
 
     def __repr__(self):
@@ -96,6 +99,9 @@ class GlycopeptideSpectrumSolutionSet(Base, BoundToAnalysis):
 
 class GlycopeptideSpectrumMatch(Base, SpectrumMatchBase):
     __tablename__ = "GlycopeptideSpectrumMatch"
+
+    _loaded_targets = WeakValueDictionary()
+    _loaded_scans = WeakValueDictionary()
 
     id = Column(Integer, primary_key=True)
     solution_set_id = Column(
@@ -129,10 +135,21 @@ class GlycopeptideSpectrumMatch(Base, SpectrumMatchBase):
         return inst
 
     def convert(self):
-        scan_ref = SpectrumReference(self.scan.scan_id, self.scan.precursor_information)
-        target_ref = TargetReference(self.structure_id)
-        inst = MemorySpectrumMatch(scan_ref, target_ref, self.score, self.is_best_match)
+        try:
+            scan = self._loaded_scans[self.scan_id]
+        except KeyError:
+            session = object_session(self)
+            scan = session.query(MSScan).get(self.scan_id).convert()
+            self._loaded_scans[self.scan_id] = scan
+        try:
+            target = self._loaded_targets[self.structure_id]
+        except KeyError:
+            session = object_session(self)
+            target = session.query(Glycopeptide).get(self.structure_id).convert()
+            self._loaded_targets[self.structure_id] = target
+        inst = MemorySpectrumMatch(scan, target, self.score, self.is_best_match)
         inst.q_value = self.q_value
+        inst.id = self.id
         return inst
 
     def __repr__(self):

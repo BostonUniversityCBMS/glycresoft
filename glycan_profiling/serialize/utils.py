@@ -1,6 +1,5 @@
 import os
 from copy import copy
-from time import time
 from uuid import uuid4
 from sqlalchemy import create_engine, Table
 from sqlalchemy.exc import OperationalError, ProgrammingError
@@ -263,7 +262,7 @@ class toggle_indices(object):
 
     def drop(self):
         for index in self.table.indexes:
-            log_handle.log("Dropping Index %r" % index)
+            # log_handle.log("Dropping Index %r" % index)
             try:
                 conn = self.session.connection()
                 index.drop(conn)

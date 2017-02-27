@@ -1,3 +1,4 @@
+import time
 from collections import namedtuple
 from operator import mul
 try:

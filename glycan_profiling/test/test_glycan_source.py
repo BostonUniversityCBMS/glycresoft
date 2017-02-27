@@ -5,8 +5,8 @@ from glycan_profiling.database.builder.glycan import glycan_source
 
 
 FILE_SOURCE = '''
-{Hex:3; HexNAc:2}
-{Fuc:1; Hex:3; HexNAc:2}
+{Hex:3; HexNAc:2}  N-Glycan  O-Glycan
+{Fuc:1; Hex:3; HexNAc:2}  N-Glycan
 '''
 
 
@@ -24,11 +24,12 @@ class GlycanSourceTests(unittest.TestCase):
         file_name = self.setup_tempfile()
         builder = glycan_source.TextFileGlycanHypothesisSerializer(
             file_name, file_name + '.db')
-        builder.run()
+        builder.start()
         inst = builder.query(glycan_source.DBGlycanComposition).filter(
             glycan_source.DBGlycanComposition.hypothesis_id == builder.hypothesis_id,
             glycan_source.DBGlycanComposition.composition == "{Hex:3; HexNAc:2}").one()
         self.assertAlmostEqual(inst.calculated_mass, 910.32777, 3)
+        self.assertTrue("N-Glycan" in inst.structure_classes)
         builder.engine.dispose()
         self.clear_file(file_name + '.db')
         self.clear_file(file_name)
@@ -37,7 +38,7 @@ class GlycanSourceTests(unittest.TestCase):
         file_name = self.setup_tempfile()
         builder = glycan_source.TextFileGlycanHypothesisSerializer(
             file_name, file_name + '.db', reduction="H2")
-        builder.run()
+        builder.start()
         inst = builder.query(glycan_source.DBGlycanComposition).filter(
             glycan_source.DBGlycanComposition.hypothesis_id == builder.hypothesis_id,
             glycan_source.DBGlycanComposition.composition == "{Hex:3; HexNAc:2}$H2").one()
@@ -50,7 +51,7 @@ class GlycanSourceTests(unittest.TestCase):
         file_name = self.setup_tempfile()
         builder = glycan_source.TextFileGlycanHypothesisSerializer(
             file_name, file_name + '.db', reduction="H2", derivatization='methyl')
-        builder.run()
+        builder.start()
         inst = builder.query(glycan_source.DBGlycanComposition).filter(
             glycan_source.DBGlycanComposition.hypothesis_id == builder.hypothesis_id,
             glycan_source.DBGlycanComposition.composition == "{Hex^Me:3; HexNAc^Me:2}$C1H4").one()

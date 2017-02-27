@@ -95,6 +95,7 @@ class GlycanCombinationSerializer(DatabaseBoundOperation, TaskBase):
 
         relation_acc = []
         i = 0
+        j = 0
         hypothesis_id = self.target_hypothesis_id
         self.log("... Building combinations for Hypothesis %d" % hypothesis_id)
         for comb, counts in combinator.combinate_all():
@@ -110,14 +111,22 @@ class GlycanCombinationSerializer(DatabaseBoundOperation, TaskBase):
                 })
 
             i += 1
-            if i > 10000:
+            j += 1
+            if i > 50000:
+                self.log("%d combinations created" % j)
                 self.session.execute(
                     GlycanCombinationGlycanComposition.insert(), relation_acc)
                 i = 0
                 relation_acc = []
-        self.session.execute(
-            GlycanCombinationGlycanComposition.insert(), relation_acc)
+        if relation_acc:
+            self.session.execute(
+                GlycanCombinationGlycanComposition.insert(), relation_acc)
         self.session.commit()
 
     def run(self):
-        return self.generate()
+        self.generate()
+        total = self.session.query(
+            GlycanCombination).filter(
+            GlycanCombination.hypothesis_id == self.target_hypothesis_id
+        ).count()
+        self.log("%d Glycan Combinations Constructed." % (total,))

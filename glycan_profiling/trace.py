@@ -1,4 +1,7 @@
-from collections import defaultdict, OrderedDict, namedtuple
+import time
+from collections import defaultdict
+
+import numpy as np
 
 from glycan_profiling.task import TaskBase
 
@@ -9,21 +12,14 @@ from .chromatogram_tree import (
     ChromatogramFilter, GlycanCompositionChromatogram, GlycopeptideChromatogram,
     ChromatogramOverlapSmoother)
 
-from .scan_cache import (
-    NullScanCacheHandler, ThreadedDatabaseScanCacheHandler)
+from .scan_cache import NullScanCacheHandler
 
 from .scoring import (
     ChromatogramSolution, NetworkScoreDistributor, ChromatogramScorer)
 
 
-dummyscan = namedtuple('dummyscan', ["id", "index", "scan_time"])
-
-
-fake_scan = dummyscan("--not-a-real-scan--", -1, -1)
-
-
 class ScanSink(object):
-    def __init__(self, scan_generator, cache_handler_type=ThreadedDatabaseScanCacheHandler):
+    def __init__(self, scan_generator, cache_handler_type=NullScanCacheHandler):
         self.scan_generator = scan_generator
         self.scan_store = None
         self._scan_store_type = cache_handler_type
@@ -42,10 +38,9 @@ class ScanSink(object):
         except AttributeError:
             return None
 
-    def configure_cache(self, storage_path=None, name=None):
-        if storage_path is None:
-            storage_path = self.scan_source
-        self.scan_store = self._scan_store_type.configure_storage(storage_path, name)
+    def configure_cache(self, storage_path=None, name=None, source=None):
+        self.scan_store = self._scan_store_type.configure_storage(
+            storage_path, name, source)
 
     def configure_iteration(self, *args, **kwargs):
         self.scan_generator.configure_iteration(*args, **kwargs)
@@ -82,137 +77,6 @@ class ScanSink(object):
 
     def next(self):
         return self.next_scan()
-
-
-class Tracer(ScanSink):
-    def __init__(self, scan_generator, database, mass_error_tolerance=1e-5,
-                 cache_handler_type=ThreadedDatabaseScanCacheHandler):
-
-        super(Tracer, self).__init__(scan_generator, cache_handler_type)
-        self.database = database
-
-        self.tracker = defaultdict(OrderedDict)
-        self.mass_error_tolerance = mass_error_tolerance
-
-        self.total_ion_chromatogram = SimpleChromatogram(self)
-        self.base_peak_chromatogram = SimpleChromatogram(self)
-
-    def _handle_generic_chromatograms(self, scan):
-        tic = sum(p.intensity for p in scan)
-        self.total_ion_chromatogram[scan.id] = tic
-        self.base_peak_chromatogram[scan.id] = max(p.intensity for p in scan) if tic > 0 else 0
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self.next()
-
-    def next(self):
-        idents = defaultdict(list)
-        try:
-            scan = self.next_scan()
-            self._handle_generic_chromatograms(scan)
-        except (ValueError, IndexError) as e:
-            print(e)
-            return idents, fake_scan
-        for peak in scan.deconvoluted_peak_set:
-            for match in self.database.search_mass_ppm(
-                    peak.neutral_mass, self.mass_error_tolerance):
-                self.tracker[match.serialize()].setdefault(scan.id, [])
-                self.tracker[match.serialize()][scan.id].append(peak)
-                idents[peak].append(match)
-        return idents, scan
-
-    def truncate_chromatograms(self, chromatograms):
-        start, stop = find_truncation_points(*self.total_ion_chromatogram.as_arrays())
-        out = []
-        for c in chromatograms:
-            if len(c) == 0:
-                continue
-            c.truncate_before(start)
-            if len(c) == 0:
-                continue
-            c.truncate_after(stop)
-            if len(c) == 0:
-                continue
-            out.append(c)
-        return out
-
-    def find_truncation_points(self):
-        start, stop = find_truncation_points(*self.total_ion_chromatogram.as_arrays())
-        return start, stop
-
-    def build_chromatograms(self, truncate=True):
-        chroma = [
-            Chromatogram.from_parts(composition, map(
-                self.scan_id_to_rt, observations), observations.keys(),
-                observations.values())
-            for composition, observations in self.tracker.items()
-        ]
-        if truncate:
-            chroma = self.truncate_chromatograms(chroma)
-        return chroma
-
-
-class IncludeUnmatchedTracer(Tracer):
-
-    def __init__(self, scan_generator, database, mass_error_tolerance=1e-5,
-                 cache_handler_type=ThreadedDatabaseScanCacheHandler):
-        super(IncludeUnmatchedTracer, self).__init__(
-            scan_generator, database, mass_error_tolerance, cache_handler_type=cache_handler_type)
-        self.unmatched = []
-
-    def next(self):
-        idents = defaultdict(list)
-        try:
-            scan = self.next_scan()
-            self._handle_generic_chromatograms(scan)
-        except (ValueError, IndexError) as e:
-            print(e)
-            return idents, fake_scan
-        for peak in scan.deconvoluted_peak_set:
-            matches = self.database.search_mass_ppm(
-                peak.neutral_mass, self.mass_error_tolerance)
-            if matches:
-                for match in matches:
-                    self.tracker[match.serialize()].setdefault(scan.id, [])
-                    self.tracker[match.serialize()][scan.id].append(peak)
-                    idents[peak].append(match)
-            else:
-                self.unmatched.append((scan.id, peak))
-        return idents, scan
-
-    def build_chromatograms(self, minimum_mass=300, minimum_intensity=1000., grouping_tolerance=None, truncate=True):
-        if grouping_tolerance is None:
-            grouping_tolerance = self.mass_error_tolerance
-        chroma = sorted(super(
-            IncludeUnmatchedTracer, self).build_chromatograms(truncate=truncate), key=lambda x: x.neutral_mass)
-        forest = ChromatogramForest(chroma, grouping_tolerance, self.scan_id_to_rt)
-        forest.aggregate_unmatched_peaks(self.unmatched, minimum_mass, minimum_intensity)
-        chroma = list(forest)
-        if truncate:
-            chroma = self.truncate_chromatograms(chroma)
-        return chroma
-
-
-class NonAggregatingTracer(Tracer):
-    def __init__(self, scan_generator, cache_handler_type=ThreadedDatabaseScanCacheHandler):
-        super(NonAggregatingTracer, self).__init__(
-            scan_generator, [], 1e-5, cache_handler_type=cache_handler_type)
-
-        def next(self):
-            idents = defaultdict(list)
-            try:
-                scan = self.next_scan()
-                self._handle_generic_chromatograms(scan)
-            except (ValueError, IndexError) as e:
-                print(e)
-                return idents, fake_scan
-            return idents, scan
-
-    def build_chromatograms(self, *args, **kwargs):
-        raise NotImplementedError()
 
 
 def span_overlap(self, interval):
@@ -397,7 +261,7 @@ class ChromatogramMatcher(TaskBase):
                 candidate_chromatograms.append(chroma)
 
         for chroma in candidate_chromatograms:
-            candidate_mass = chroma.neutral_mass
+            candidate_mass = chroma.weighted_neutral_mass
             matched = False
             exclude = False
             for adduct in adducts:
@@ -433,7 +297,7 @@ class ChromatogramMatcher(TaskBase):
         for chroma in chromatograms:
             add = chroma
             for adduct in adducts:
-                match = chromatograms.find_mass(chroma.neutral_mass + adduct.mass, mass_error_tolerance)
+                match = chromatograms.find_mass(chroma.weighted_neutral_mass + adduct.mass, mass_error_tolerance)
                 if match and span_overlap(add, match):
                     try:
                         match.used_as_adduct.append((add.key, adduct))
@@ -541,11 +405,16 @@ class ChromatogramEvaluator(TaskBase):
         i = 0
         n = len(filtered)
         for case in filtered:
+            start = time.time()
             i += 1
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 self.log("%0.2f%% chromatograms evaluated (%d/%d)" % (i * 100. / n, i, n))
             try:
                 solutions.append(ChromatogramSolution(case, scorer=self.scoring_model))
+                end = time.time()
+                # Report on anything that took more than 30 seconds to evaluate
+                if end - start > 30.0:
+                    self.log("%r took a long time to evaluated (%0.2fs)" % (case, end - start))
             except (IndexError, ValueError):
                 continue
         if base_coef != 1.0 and self.network is not None:
@@ -557,8 +426,9 @@ class ChromatogramEvaluator(TaskBase):
 
         solutions = self.evaluate(chromatograms, base_coef, support_coef, rt_delta, min_points, smooth)
 
-        if adducts is not None:
+        if adducts is not None and len(adducts):
             hold = prune_bad_adduct_branches(ChromatogramFilter(solutions))
+            self.log("Re-evaluating after adduct pruning")
             solutions = self.evaluate(hold, base_coef, support_coef, rt_delta)
 
         solutions = ChromatogramFilter(sol for sol in solutions if sol.score > 1e-5)
@@ -583,7 +453,6 @@ class ChromatogramExtractor(TaskBase):
         self.min_points = min_points
         self.delta_rt = delta_rt
 
-        self.tracer = None
         self.accumulated = None
         self.annotated_peaks = None
         self.peak_mapping = None
@@ -592,18 +461,28 @@ class ChromatogramExtractor(TaskBase):
         self.base_peak_chromatogram = None
         self.total_ion_chromatogram = None
 
+    def get_scan_by_id(self, scan_id):
+        return self.peak_loader.get_scan_by_id(scan_id)
+
+    def get_scan_header_by_id(self, scan_id):
+        return self.peak_loader.get_scan_header_by_id(scan_id)
+
+    def get_index_information_by_scan_id(self, scan_id):
+        return self.peak_loader.get_index_information_by_scan_id(scan_id)
+
+    def scan_id_to_rt(self, scan_id):
+        return self.peak_loader.convert_scan_id_to_retention_time(scan_id)
+
     def load_peaks(self):
         self.accumulated = self.peak_loader.ms1_peaks_above(self.minimum_mass)
         self.annotated_peaks = [x[:2] for x in self.accumulated]
         self.peak_mapping = {x[:2]: x[2] for x in self.accumulated}
+        self.minimum_intensity = np.percentile([p[1].intensity for p in self.accumulated], 5)
 
     def aggregate_chromatograms(self):
-        self.tracer = IncludeUnmatchedTracer(self.peak_loader, [], cache_handler_type=NullScanCacheHandler)
-        self.tracer.unmatched.extend(self.annotated_peaks)
-        chroma = self.tracer.build_chromatograms(
-            minimum_mass=self.minimum_mass, minimum_intensity=self.minimum_intensity,
-            grouping_tolerance=self.grouping_tolerance,
-            truncate=False)
+        forest = ChromatogramForest([], self.grouping_tolerance, self.scan_id_to_rt)
+        forest.aggregate_peaks(self.annotated_peaks, self.minimum_mass, self.minimum_intensity)
+        chroma = list(forest)
         self.log("%d Chromatograms Extracted." % (len(chroma),))
         self.chromatograms = ChromatogramFilter.process(
             chroma, min_points=self.min_points, delta_rt=self.delta_rt)
@@ -612,15 +491,17 @@ class ChromatogramExtractor(TaskBase):
         mapping = defaultdict(list)
         for scan_id, peak in self.annotated_peaks:
             mapping[scan_id].append(peak.intensity)
-        bpc = SimpleChromatogram(self.tracer)
-        tic = SimpleChromatogram(self.tracer)
-        for scan_id, intensities in sorted(mapping.items(), key=lambda (b): self.tracer.scan_id_to_rt(b[0])):
+        bpc = SimpleChromatogram(self)
+        tic = SimpleChromatogram(self)
+        collection = sorted(mapping.items(), key=lambda b: self.scan_id_to_rt(b[0]))
+        for scan_id, intensities in collection:
             bpc[scan_id] = max(intensities)
             tic[scan_id] = sum(intensities)
         self.base_peak_chromatogram = bpc
         self.total_ion_chromatogram = tic
 
     def run(self):
+        self.log("... Begin Extracting Chromatograms")
         self.load_peaks()
         self.aggregate_chromatograms()
         self.summary_chromatograms()
@@ -646,7 +527,7 @@ class ChromatogramExtractor(TaskBase):
 
     def __iter__(self):
         if self.chromatograms is None:
-            self.start()
+            self.run()
         return iter(self.chromatograms)
 
 
@@ -687,7 +568,7 @@ class ChromatogramProcessor(TaskBase):
 
     def __iter__(self):
         if self.accepted_solutions is None:
-            self.start()
+            self.run()
         return iter(self.accepted_solutions)
 
 

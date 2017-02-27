@@ -27,7 +27,7 @@ def binary_search_with_flag(array, mass, error_tolerance=1e-5):
     lo = 0
     n = hi = len(array)
     while hi != lo:
-        mid = (hi + lo) / 2
+        mid = (hi + lo) // 2
         x = array[mid]
         err = (x.neutral_mass - mass) / mass
         if abs(err) <= error_tolerance:
@@ -81,6 +81,10 @@ class ChromatogramFilter(object):
                 x.neutral_mass, x.start_time))]
         else:
             self.chromatograms = list(chromatograms)
+        self._key_map = None
+        self._intervals = None
+
+    def _invalidate(self):
         self._key_map = None
         self._intervals = None
 
@@ -197,7 +201,9 @@ class ChromatogramFilter(object):
         high_index = min(n - 1, high_index)
         if self[high_index].neutral_mass > high:
             high_index -= 1
-        return ChromatogramFilter(self[low_index:high_index], sort=False)
+        items = self[low_index:high_index]
+        items = [c for c in items if low <= c.neutral_mass <= high]
+        return ChromatogramFilter(items, sort=False)
 
     def filter(self, filter_fn):
         return self.__class__([x for x in self if filter_fn(x)], sort=False)
@@ -208,6 +214,20 @@ class ChromatogramFilter(object):
 
     def smooth_overlaps(self, mass_error_tolerance=1e-5):
         return self.__class__(smooth_overlaps(self, mass_error_tolerance))
+
+    def extend(self, other):
+        chroma = []
+        chroma.extend(self)
+        chroma.extend(other)
+        self.chromatograms = [c for c in sorted([c for c in chroma if len(c)], key=lambda x: (
+                              x.neutral_mass, x.start_time))]
+        self._invalidate()
+
+    def __add__(self, other):
+        inst = self.__class__([])
+        inst.extend(self)
+        inst.extend(other)
+        return inst
 
 
 class DisjointChromatogramSet(object):

@@ -73,7 +73,7 @@ class BiGaussianModel(PeakShapeModelBase):
 
     @staticmethod
     def shape(xs, center, amplitude, sigma_left, sigma_right):
-        ys = np.zeros_like(xs)
+        ys = np.zeros_like(xs, dtype=np.float32)
         left_mask = xs < center
         ys[left_mask] = amplitude * np.exp(-(xs[left_mask] - center) ** 2 / (2 * sigma_left ** 2)) * sqrt(2 * pi)
         right_mask = xs > center
@@ -119,6 +119,12 @@ class ChromatogramShapeFitterBase(object):
     def extract_arrays(self):
         self.xs, self.ys = self.chromatogram.as_arrays()
         if self.smooth:
+            self.ys = gaussian_filter1d(self.ys, 1)
+        if len(self.xs) > 2000:
+            new_xs = np.linspace(self.xs.min(), self.xs.max(), 2000)
+            new_ys = np.interp(new_xs, self.xs, self.ys)
+            self.xs = new_xs
+            self.ys = new_ys
             self.ys = gaussian_filter1d(self.ys, 1)
 
     def compute_residuals(self):
@@ -347,6 +353,9 @@ class AdaptiveMultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
             model_fit = ProfileSplittingMultimodalChromatogramShapeFitter(
                 self.chromatogram, self.max_peaks, self.smooth, fitter=fitter)
             self.alternative_fits.append(model_fit)
+            model_fit = MultimodalChromatogramShapeFitter(
+                self.chromatogram, self.max_peaks, self.smooth, fitter=fitter)
+            self.alternative_fits.append(model_fit)
         self.best_fit = min(self.alternative_fits, key=lambda x: x.line_test)
         self.params_list = self.best_fit.params_list
         self.params_dict_list = self.best_fit.params_dict_list
@@ -365,6 +374,8 @@ class AdaptiveMultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
 
 
 class SplittingPoint(object):
+    __slots__ = ["first_maximum", "minimum", "second_maximum", "minimum_index", "total_distance"]
+
     def __init__(self, first_maximum, minimum, second_maximum, minimum_index):
         self.first_maximum = first_maximum
         self.minimum = minimum
@@ -419,8 +430,12 @@ class ProfileSplittingMultimodalChromatogramShapeFitter(ChromatogramShapeFitterB
                 max_j = maxima_indices[j]
                 for k in range(len(minima_indices)):
                     min_k = minima_indices[k]
-                    if max_i < min_k < max_j:
-                        point = SplittingPoint(ys[max_i], ys[min_k], ys[max_j], xs[min_k])
+                    y_i = ys[max_i]
+                    y_j = ys[max_j]
+                    y_k = ys[min_k]
+                    if max_i < min_k < max_j and (y_i - y_k) > (y_i * 0.01) and (
+                            y_j - y_k) > (y_j * 0.01):
+                        point = SplittingPoint(y_i, y_k, y_j, xs[min_k])
                         candidates.append(point)
         if candidates:
             best_point = max(candidates, key=lambda x: x.total_distance)

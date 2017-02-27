@@ -1,1 +1,8 @@
 *.pyc
+data/
+.ipynb_checkpoints/
+build/
+dist/
+*.egg-info
+*.sublime*
+*glycresoft-log

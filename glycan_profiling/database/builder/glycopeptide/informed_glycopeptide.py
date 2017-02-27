@@ -2,7 +2,9 @@ import os
 from multiprocessing import Queue, Event
 from glycan_profiling.serialize.hypothesis.peptide import Peptide, Protein
 
-from .common import GlycopeptideHypothesisSerializerBase, PeptideGlycosylator, PeptideGlycosylatingProcess
+from .common import (
+    GlycopeptideHypothesisSerializerBase, PeptideGlycosylator,
+    PeptideGlycosylatingProcess, MultipleProcessPeptideGlycosylator)
 from .proteomics import mzid_proteome
 
 try:
@@ -15,18 +17,22 @@ class MzIdentMLGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializer
     _display_name = "MzIdentML Glycopeptide Hypothesis Serializer"
 
     def __init__(self, mzid_path, connection, glycan_hypothesis_id, hypothesis_name=None,
-                 target_proteins=None, max_glycosylation_events=1):
+                 target_proteins=None, max_glycosylation_events=1, reference_fasta=None):
         if target_proteins is None:
             target_proteins = []
         GlycopeptideHypothesisSerializerBase.__init__(self, connection, hypothesis_name, glycan_hypothesis_id)
         self.mzid_path = mzid_path
+        self.reference_fasta = reference_fasta
         self.proteome = mzid_proteome.Proteome(
-            mzid_path, self._original_connection, self.hypothesis_id, target_proteins=target_proteins)
+            mzid_path, self._original_connection, self.hypothesis_id,
+            target_proteins=target_proteins, reference_fasta=reference_fasta)
         self.target_proteins = target_proteins
         self.max_glycosylation_events = max_glycosylation_events
 
         self.set_parameters({
             "mzid_file": os.path.abspath(mzid_path),
+            "reference_fasta": os.path.abspath(
+                reference_fasta) if reference_fasta is not None else None,
             "target_proteins": target_proteins,
             "max_glycosylation_events": max_glycosylation_events,
         })
@@ -88,6 +94,7 @@ class MzIdentMLGlycopeptideHypothesisSerializer(GlycopeptideHypothesisSerializer
         self.combinate_glycans(self.max_glycosylation_events)
         self.log("Building Glycopeptides")
         self.glycosylate_peptides()
+        self._sql_analyze_database()
         self._count_produced_glycopeptides()
         self.log("Done")
 
@@ -96,35 +103,40 @@ class MultipleProcessMzIdentMLGlycopeptideHypothesisSerializer(MzIdentMLGlycopep
     _display_name = "Multiple Process MzIdentML Glycopeptide Hypothesis Serializer"
 
     def __init__(self, mzid_path, connection, glycan_hypothesis_id, hypothesis_name=None,
-                 target_proteins=None, max_glycosylation_events=1, n_processes=4):
+                 target_proteins=None, max_glycosylation_events=1, reference_fasta=None,
+                 n_processes=4):
         super(MultipleProcessMzIdentMLGlycopeptideHypothesisSerializer, self).__init__(
             mzid_path, connection, glycan_hypothesis_id, hypothesis_name, target_proteins,
-            max_glycosylation_events)
+            max_glycosylation_events, reference_fasta)
         self.n_processes = n_processes
 
     def glycosylate_peptides(self):
-        input_queue = Queue(15)
-        done_event = Event()
-        processes = [
-            PeptideGlycosylatingProcess(
-                self._original_connection, self.hypothesis_id, input_queue,
-                chunk_size=15000, done_event=done_event) for i in range(self.n_processes)
-        ]
-        peptide_ids = self.peptide_ids()
-        i = 0
-        n = len(peptide_ids)
-        chunk_size = 50
-        for process in processes:
-            input_queue.put(peptide_ids[i:(i + chunk_size)])
-            i += chunk_size
-            process.start()
+        # input_queue = Queue(15)
+        # done_event = Event()
+        # processes = [
+        #     PeptideGlycosylatingProcess(
+        #         self._original_connection, self.hypothesis_id, input_queue,
+        #         chunk_size=3500, done_event=done_event) for i in range(self.n_processes)
+        # ]
+        # peptide_ids = self.peptide_ids()
+        # i = 0
+        # n = len(peptide_ids)
+        # chunk_size = min(int(n * 0.05), 1000)
+        # for process in processes:
+        #     input_queue.put(peptide_ids[i:(i + chunk_size)])
+        #     i += chunk_size
+        #     process.start()
 
-        while i < n:
-            input_queue.put(peptide_ids[i:(i + chunk_size)])
-            i += chunk_size
-            self.log("... Dealt Peptides %d-%d %0.2f%%" % (i - chunk_size, i, (i / float(n)) * 100))
+        # while i < n:
+        #     input_queue.put(peptide_ids[i:(i + chunk_size)])
+        #     i += chunk_size
+        #     self.log("... Dealt Peptides %d-%d %0.2f%%" % (i - chunk_size, min(i, n), min((i / float(n)) * 100, 100.0)))
 
-        self.log("... All Peptides Dealt")
-        done_event.set()
-        for process in processes:
-            process.join()
+        # self.log("... All Peptides Dealt")
+        # done_event.set()
+        # for process in processes:
+        #     process.join()
+        dispatcher = MultipleProcessPeptideGlycosylator(
+            self._original_connection, self.hypothesis_id,
+            n_processes=self.n_processes)
+        dispatcher.process(self.peptide_ids())

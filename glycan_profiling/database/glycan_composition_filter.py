@@ -99,7 +99,6 @@ class QuerySet(object):
         n = len(queries)
         out = []
         for key, value in member_map.items():
-            print key, value, n
             if value == n:
                 out.append(item_map[key])
         return out
@@ -145,11 +144,11 @@ class QueryComposer(object):
     def collate(self):
         monosaccharides = list(map(str, self.parent.monosaccharides))
         filters = sorted(self.filters, key=lambda x: str(x.key))
+        kept_filters = []
         for filt in filters:
-            if filt.key not in monosaccharides:
-                raise KeyError(filt.key)
-        else:
-            return filters
+            if filt.key in monosaccharides:
+                kept_filters.append(filt)
+        return kept_filters
 
     def __eq__(self, other):
         if isinstance(other, QueryComposer):

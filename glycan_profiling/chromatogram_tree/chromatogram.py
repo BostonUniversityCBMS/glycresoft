@@ -142,6 +142,17 @@ class Chromatogram(object):
         }
 
     @property
+    def integrated_abundance(self):
+        spacing = np.array([
+            node.retention_time for node in self.nodes
+        ])
+        values = np.array([
+            node.total_intensity() for node in self.nodes
+        ])
+        integrated = np.trapz(values, spacing)
+        return integrated
+
+    @property
     def adducts(self):
         if self._adducts is None:
             self._infer_adducts()
@@ -250,9 +261,9 @@ class Chromatogram(object):
         return self._end_time
 
     def as_arrays(self):
-        rts = np.array([node.retention_time for node in self.nodes])
-        intens = np.array([node.total_intensity() for node in self.nodes])
-        return rts, intens
+        rts = np.array([node.retention_time for node in self.nodes], dtype=np.float64)
+        signal = np.array([node.total_intensity() for node in self.nodes], dtype=np.float64)
+        return rts, signal
 
     def __len__(self):
         return len(self.nodes)
@@ -534,6 +545,10 @@ class ChromatogramTreeList(object):
     def common_nodes(self, other):
         return len(self.node_id_hash & other.node_id_hash)
 
+    def __repr__(self):
+        return "ChromatogramTreeList(%d nodes, %0.2f-%0.2f)" % (
+            len(self), self[0].scan_time, self[-1].scan_time)
+
 
 class ChromatogramTreeNode(object):
     def __init__(self, retention_time=None, scan_id=None, children=None, members=None,
@@ -693,9 +708,6 @@ class ChromatogramTreeNode(object):
             kinds.extend(child.node_types())
         return kinds
 
-    def get_chromatogram(self):
-        return self
-
 
 class ChromatogramInterface(object):
     __metaclass__ = ABCMeta
@@ -716,6 +728,15 @@ class ChromatogramWrapper(object):
 
     def __len__(self):
         return len(self.chromatogram)
+
+    def __hash__(self):
+        return hash(self.chromatogram)
+
+    def __eq__(self, other):
+        try:
+            return self.chromatogram == get_chromatogram(other)
+        except:
+            return False
 
     @property
     def nodes(self):
@@ -746,6 +767,10 @@ class ChromatogramWrapper(object):
         return self.chromatogram.total_signal
 
     @property
+    def integrated_abundance(self):
+        return self.chromatogram.integrated_abundance
+
+    @property
     def start_time(self):
         return self.chromatogram.start_time
 
@@ -754,9 +779,7 @@ class ChromatogramWrapper(object):
         return self.chromatogram.end_time
 
     def as_arrays(self):
-        rts = np.array([node.retention_time for node in self])
-        intens = np.array([node.total_intensity() for node in self])
-        return rts, intens
+        return self.chromatogram.as_arrays()
 
     def overlaps_in_time(self, interval):
         return self.chromatogram.overlaps_in_time(interval)

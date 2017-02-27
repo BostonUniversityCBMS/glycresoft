@@ -1,4 +1,4 @@
-from glycan_profiling.task import TaskBase
+from glycan_profiling.task import TaskBase, log_handle
 from glycan_profiling.chromatogram_tree import ChromatogramWrapper, build_rt_interval_tree, ChromatogramFilter
 from glycan_profiling.chromatogram_tree.chromatogram import GlycopeptideChromatogram
 from collections import defaultdict, namedtuple
@@ -6,31 +6,7 @@ from collections import defaultdict, namedtuple
 SolutionEntry = namedtuple("SolutionEntry", "solution, score, percentile, best_score")
 
 
-class TandemAnnotatedChromatogram(ChromatogramWrapper):
-    def __init__(self, chromatogram):
-        super(TandemAnnotatedChromatogram, self).__init__(chromatogram)
-        self.tandem_solutions = []
-        self.time_displaced_assignments = []
-        self.best_msms_score = None
-
-    def add_solution(self, item):
-        self.tandem_solutions.append(item)
-
-    def add_displaced_solution(self, item):
-        self.tandem_solutions.append(item)
-
-    def merge(self, other):
-        new = self.__class__(self.chromatogram.merge(other.chromatogram))
-        new.tandem_solutions = self.tandem_solutions + other.tandem_solutions
-        new.time_displaced_assignments = self.time_displaced_assignments + other.time_displaced_assignments
-        return new
-
-    def merge_in_place(self, other):
-        new = self.chromatogram.merge(other.chromatogram)
-        self.chromatogram = new
-        self.tandem_solutions = self.tandem_solutions + other.tandem_solutions
-        self.time_displaced_assignments = self.time_displaced_assignments + other.time_displaced_assignments
-
+class SpectrumMatchSolutionCollectionBase(object):
     def _compute_representative_weights(self, threshold_fn=lambda x: True):
         scores = defaultdict(float)
         best_scores = defaultdict(float)
@@ -52,6 +28,35 @@ class TandemAnnotatedChromatogram(ChromatogramWrapper):
         if weights:
             return [x for x in weights if abs(x.percentile - weights[0].percentile) < 1e-5]
 
+
+class TandemAnnotatedChromatogram(ChromatogramWrapper, SpectrumMatchSolutionCollectionBase):
+    def __init__(self, chromatogram):
+        super(TandemAnnotatedChromatogram, self).__init__(chromatogram)
+        self.tandem_solutions = []
+        self.time_displaced_assignments = []
+        self.best_msms_score = None
+
+    def add_solution(self, item):
+        case_mass = item.precursor_ion_mass()
+        if abs(case_mass - self.chromatogram.neutral_mass) > 100:
+            log_handle.log("Warning, mis-assigned spectrum match to chromatogram %r, %r" % (self, item))
+        self.tandem_solutions.append(item)
+
+    def add_displaced_solution(self, item):
+        self.add_solution(item)
+
+    def merge(self, other):
+        new = self.__class__(self.chromatogram.merge(other.chromatogram))
+        new.tandem_solutions = self.tandem_solutions + other.tandem_solutions
+        new.time_displaced_assignments = self.time_displaced_assignments + other.time_displaced_assignments
+        return new
+
+    def merge_in_place(self, other):
+        new = self.chromatogram.merge(other.chromatogram)
+        self.chromatogram = new
+        self.tandem_solutions = self.tandem_solutions + other.tandem_solutions
+        self.time_displaced_assignments = self.time_displaced_assignments + other.time_displaced_assignments
+
     def assign_entity(self, solution_entry, entity_chromatogram_type=GlycopeptideChromatogram):
         entity_chroma = entity_chromatogram_type(
             self.chromatogram.composition,
@@ -60,6 +65,27 @@ class TandemAnnotatedChromatogram(ChromatogramWrapper):
         entity_chroma.entity = solution_entry.solution
         self.chromatogram = entity_chroma
         self.best_msms_score = solution_entry.best_score
+
+
+class TandemSolutionsWithoutChromatogram(SpectrumMatchSolutionCollectionBase):
+    def __init__(self, entity, tandem_solutions):
+        self.entity = entity
+        self.composition = entity
+        self.tandem_solutions = tandem_solutions
+
+    @classmethod
+    def aggregate(cls, solutions):
+        collect = defaultdict(list)
+        for solution in solutions:
+            best_match = solution.best_solution()
+            collect[best_match.target.id].append(solution)
+        out = []
+        for group in collect.values():
+            solution = group[0]
+            best_match = solution.best_solution()
+            structure = best_match.target
+            out.append(cls(structure, group))
+        return out
 
 
 class ScanTimeBundle(object):
@@ -74,7 +100,8 @@ class ScanTimeBundle(object):
         return self.solution == other.solution and self.scan_time == other.scan_time
 
     def __repr__(self):
-        return "ScanTimeBundle(%s, %0.4f)" % (self.solution, self.scan_time)
+        return "ScanTimeBundle(%s, %0.4f, %0.4f)" % (
+            self.solution.scan.id, self.solution.score, self.scan_time)
 
 
 def aggregate_by_assigned_entity(annotated_chromatograms, delta_rt=0.25):
@@ -131,7 +158,8 @@ class ChromatogramMSMSMapper(TaskBase):
         for solution in solutions:
             self.find_chromatogram_for(solution)
 
-    def distribute_orphans(self):
+    def distribute_orphans(self, threshold_fn=lambda x: x.q_value < 0.05):
+        lost = []
         for orphan in self.orphans:
             mass = orphan.solution.precursor_ion_mass()
             window = self.error_tolerance * mass
@@ -148,8 +176,11 @@ class ChromatogramMSMSMapper(TaskBase):
                     new_owner = candidates[best_index]
                     new_owner.add_displaced_solution(orphan.solution)
             else:
-                self.log("No chromatogram found for %r, q-value %0.4f (mass: %0.4f, time: %0.4f)" % (
-                    orphan, orphan.solution.q_value, mass, time))
+                if threshold_fn(orphan.solution):
+                    self.log("No chromatogram found for %r, q-value %0.4f (mass: %0.4f, time: %0.4f)" % (
+                        orphan, orphan.solution.q_value, mass, time))
+                    lost.append(orphan.solution)
+        self.orphans = TandemSolutionsWithoutChromatogram.aggregate(lost)
 
     def assign_entities(self, threshold_fn=lambda x: x.q_value < 0.05, entity_chromatogram_type=None):
         if entity_chromatogram_type is None:
