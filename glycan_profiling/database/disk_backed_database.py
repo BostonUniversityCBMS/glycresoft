@@ -2,7 +2,7 @@ import operator
 
 try:
     from itertools import imap
-except:
+except ImportError:
     imap = map
 
 import logging
@@ -20,10 +20,6 @@ from .lru import LRUCache
 from .structure_loader import CachingGlycanCompositionParser
 from .composition_network import CompositionGraph, n_glycan_distance
 
-try:
-    basestring
-except:
-    basestring = (str, bytes)
 
 logger = logging.getLogger("glycresoft.database")
 
@@ -382,7 +378,7 @@ class GlycanCompositionDiskBackedStructureDatabase(DeclarativeDiskBackedDatabase
     def glycan_composition_network(self):
         if self._glycan_composition_network is None:
             self._glycan_composition_network = CompositionGraph(tuple(self.structures))
-            self._glycan_composition_network.create_edges(2, n_glycan_distance)
+            self._glycan_composition_network.create_edges(1, n_glycan_distance)
         return self._glycan_composition_network
 
     @property
@@ -638,7 +634,7 @@ class LRUIntervalSet(IntervalSet):
         try:
             super(LRUIntervalSet, self).extend_interval(target, expansion)
             self.lru.add_node(target)
-        except:
+        except Exception:
             self.lru.add_node(target)
             raise
 

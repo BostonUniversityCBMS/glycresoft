@@ -82,14 +82,13 @@ def _copy_hypothesis_across_file_boundaries(database_connection, source, hypothe
     source_handle = DatabaseBoundOperation(source)
     source_hypothesis_id = None
     source_hypothesis_name = None
-    # source_hypothesis_uuid = None
+
     try:
         hypothesis_id = int(identifier)
         inst = source_handle.query(GlycanHypothesis).get(hypothesis_id)
         if inst is not None:
             source_hypothesis_id = hypothesis_id
             source_hypothesis_name = inst.name
-            # source_hypothesis_uuid = inst.uuid
 
     except TypeError:
         hypothesis_name = identifier
@@ -98,7 +97,6 @@ def _copy_hypothesis_across_file_boundaries(database_connection, source, hypothe
         if inst is not None:
             source_hypothesis_id = inst.id
             source_hypothesis_name = inst.name
-            # source_hypothesis_uuid = inst.uuid
 
     if source == database_connection:
         return source_hypothesis_id
@@ -106,6 +104,35 @@ def _copy_hypothesis_across_file_boundaries(database_connection, source, hypothe
     mover = GlycanHypothesisCopier(
         database_connection, [(source, source_hypothesis_id)],
         hypothesis_name=source_hypothesis_name)
+    mover.run()
+    return mover.hypothesis_id
+
+
+@_glycan_hypothesis_builders("analysis")
+def _copy_analysis_across_file_boundaries(database_connection, source, hypothesis_name,
+                                          identifier=None):
+    source_handle = DatabaseBoundOperation(source)
+    source_analysis_id = None
+    source_analysis_name = None
+    try:
+        hypothesis_id = int(identifier)
+        inst = source_handle.query(Analysis).get(hypothesis_id)
+        if inst is not None:
+            source_analysis_id = hypothesis_id
+            source_analysis_name = inst.name
+
+    except TypeError:
+        hypothesis_name = identifier
+        inst = source_handle.query(Analysis).filter(
+            Analysis.name == hypothesis_name).first()
+        if inst is not None:
+            source_analysis_id = inst.id
+            source_analysis_name = inst.name
+    if hypothesis_name is None:
+        hypothesis_name = source_analysis_name
+    mover = GlycanAnalysisHypothesisSerializer(
+        source, source_analysis_id, hypothesis_name,
+        database_connection)
     mover.run()
     return mover.hypothesis_id
 
@@ -282,8 +309,8 @@ def glycan_text(context, text_file, database_connection, reduction, derivatizati
     if name is not None:
         name = validate_glycan_hypothesis_name(context, database_connection, name)
         click.secho("Building Glycan Hypothesis %s" % name, fg='cyan')
-    validate_reduction(context, reduction)
-    validate_derivatization(context, derivatization)
+    reduction = validate_reduction(context, reduction)
+    derivatization = validate_derivatization(context, derivatization)
     builder = TextFileGlycanHypothesisSerializer(
         text_file, database_connection, reduction=reduction, derivatization=derivatization,
         hypothesis_name=name)
@@ -302,8 +329,8 @@ def glycan_combinatorial(context, rule_file, database_connection, reduction, der
     if name is not None:
         name = validate_glycan_hypothesis_name(context, database_connection, name)
         click.secho("Building Glycan Hypothesis %s" % name, fg='cyan')
-    validate_reduction(context, reduction)
-    validate_derivatization(context, derivatization)
+    reduction = validate_reduction(context, reduction)
+    derivatization = validate_derivatization(context, derivatization)
     builder = CombinatorialGlycanHypothesisSerializer(
         rule_file, database_connection, reduction=reduction, derivatization=derivatization,
         hypothesis_name=name)
@@ -362,6 +389,9 @@ def glyspace_glycan_hypothesis(context, database_connection, motif_class, reduct
         serializer_type = NGlycanGlyspaceHypothesisSerializer
     elif motif_class == "o-linked":
         serializer_type = OGlycanGlyspaceHypothesisSerializer
+
+    reduction = validate_reduction(context, reduction)
+    derivatization = validate_derivatization(context, derivatization)
     job = serializer_type(
         database_connection._original_connection, name, reduction, derivatization, filter_funcs,
         simplify=True)
@@ -380,8 +410,9 @@ def from_analysis(context, database_connection, analysis_identifier, reduction, 
     if name is not None:
         name = validate_glycan_hypothesis_name(context, database_connection._original_connection, name)
         click.secho("Building Glycan Hypothesis %s" % name, fg='cyan')
-    validate_reduction(context, reduction)
-    validate_derivatization(context, derivatization)
+    reduction = validate_reduction(context, reduction)
+    derivatization = validate_derivatization(context, derivatization)
+
     analysis = get_by_name_or_id(database_connection.session, Analysis, analysis_identifier)
     if analysis.analysis_type == AnalysisTypeEnum.glycan_lc_ms:
         job = GlycanAnalysisHypothesisSerializer(database_connection._original_connection, analysis.id, name)

@@ -31,7 +31,8 @@ class CSVSerializerBase(TaskBase):
 
 class GlycanHypothesisCSVSerializer(CSVSerializerBase):
     def __init__(self, outstream, entities_iterable, delimiter=','):
-        super(GlycanHypothesisCSVSerializer, self).__init__(outstream, entities_iterable, delimiter)
+        super(GlycanHypothesisCSVSerializer, self).__init__(
+            outstream, entities_iterable, delimiter)
 
     def get_header(self):
         return [
@@ -51,7 +52,8 @@ class GlycanHypothesisCSVSerializer(CSVSerializerBase):
 
 class ImportableGlycanHypothesisCSVSerializer(CSVSerializerBase):
     def __init__(self, outstream, entities_iterable):
-        super(ImportableGlycanHypothesisCSVSerializer, self).__init__(outstream, entities_iterable, "\t")
+        super(ImportableGlycanHypothesisCSVSerializer, self).__init__(
+            outstream, entities_iterable, "\t")
 
     def get_header(self):
         return False
@@ -66,7 +68,8 @@ class ImportableGlycanHypothesisCSVSerializer(CSVSerializerBase):
 
 class GlycopeptideHypothesisCSVSerializer(CSVSerializerBase):
     def __init__(self, outstream, entities_iterable, delimiter=','):
-        super(GlycopeptideHypothesisCSVSerializer, self).__init__(outstream, entities_iterable, delimiter)
+        super(GlycopeptideHypothesisCSVSerializer, self).__init__(
+            outstream, entities_iterable, delimiter)
 
     def get_header(self):
         return [
@@ -90,7 +93,8 @@ class GlycopeptideHypothesisCSVSerializer(CSVSerializerBase):
 
 class GlycanLCMSAnalysisCSVSerializer(CSVSerializerBase):
     def __init__(self, outstream, entities_iterable, delimiter=','):
-        super(GlycanLCMSAnalysisCSVSerializer, self).__init__(outstream, entities_iterable, delimiter)
+        super(GlycanLCMSAnalysisCSVSerializer, self).__init__(
+            outstream, entities_iterable, delimiter)
 
     def get_header(self):
         return [
@@ -104,9 +108,16 @@ class GlycanLCMSAnalysisCSVSerializer(CSVSerializerBase):
             "apex_time",
             "charge_states",
             "adducts",
+            "line_score",
+            "isotopic_fit",
+            "spacing_fit",
+            "charge_count",
+            "ambiguous_with",
+            "used_as_adduct"
         ]
 
     def convert_object(self, obj):
+        scores = obj.score_components()
         attribs = [
             obj.glycan_composition,
             obj.weighted_neutral_mass,
@@ -120,6 +131,12 @@ class GlycanLCMSAnalysisCSVSerializer(CSVSerializerBase):
             obj.apex_time,
             ';'.join(map(str, obj.charge_states)),
             ';'.join([a.name for a in obj.adducts]),
+            scores.line_score,
+            scores.isotopic_fit,
+            scores.spacing_fit,
+            scores.charge_count,
+            ';'.join("%s:%s" % (p[0], p[1].name) for p in obj.ambiguous_with),
+            ';'.join("%s:%s" % (p[0], p[1].name) for p in obj.used_as_adduct)
         ]
         return map(str, attribs)
 

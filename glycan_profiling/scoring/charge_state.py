@@ -1,26 +1,49 @@
+import json
 import numpy as np
 from collections import defaultdict
 import warnings
 
-
-class ChargeStateDistributionScoringModelBase(object):
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def score(self, chromatogram, *args, **kwargs):
-        return 0
-
-    def save(self, file_obj):
-        pass
-
-    @classmethod
-    def load(cls, file_obj):
-        return cls()
+from .base import (
+    UniformCountScoringModelBase,
+    DecayRateCountScoringModelBase,
+    LogarithmicCountScoringModelBase,
+    MassScalingCountScoringModel,
+    ScoringFeatureBase)
 
 
-class UniformChargeStateScoringModel(ChargeStateDistributionScoringModelBase):
-    def score(self, chromatogram, *args, **kwargs):
-        return min(0.4 * chromatogram.n_charge_states, 1.0)
+class ChargeStateDistributionScoringModelBase(ScoringFeatureBase):
+    feature_type = "charge_count"
+
+    def get_state_count(self, chromatogram):
+        return chromatogram.n_charge_states
+
+    def get_states(self, chromatogram):
+        return chromatogram.charge_states
+
+
+_CHARGE_MODEL = ChargeStateDistributionScoringModelBase
+
+
+class UniformChargeStateScoringModel(
+        _CHARGE_MODEL, UniformCountScoringModelBase):
+    pass
+
+
+class DecayRateChargeStateScoringModel(
+        _CHARGE_MODEL, DecayRateCountScoringModelBase):
+    pass
+
+
+class LogarithmicChargeStateScoringModel(
+        _CHARGE_MODEL, LogarithmicCountScoringModelBase):
+    pass
+
+
+def decay(x, step=0.4, rate=1.5):
+    v = 0
+    for i in range(x):
+        v += (step / (i + rate))
+    return v
 
 
 def ones(x):
@@ -37,52 +60,33 @@ def neighborhood_of(x, scale=100.):
     return neighborhood * scale
 
 
-def get_sign(num):
-    if num > 0:
-        return 1
-    else:
-        return -1
+uniform_model = UniformChargeStateScoringModel()
+decay_model = DecayRateChargeStateScoringModel()
 
 
-class MassScalingChargeStateScoringModel(ChargeStateDistributionScoringModelBase):
-    def __init__(self, table, neighborhood_width=100.):
-        self.table = table
-        self.neighborhood_width = neighborhood_width
+class MassScalingChargeStateScoringModel(_CHARGE_MODEL, MassScalingCountScoringModel):
+    def handle_missing_neighborhood(self, chromatogram, neighborhood, *args, **kwargs):
+        warnings.warn(
+            ("%f was not found for this charge state "
+             "scoring model. Defaulting to uniform model") % neighborhood)
+        return uniform_model.score(chromatogram, *args, **kwargs)
 
-    def score(self, chromatogram, *args, **kwargs):
-        total = 0.
-        neighborhood = neighborhood_of(chromatogram.neutral_mass, self.neighborhood_width)
-        if neighborhood not in self.table:
-            warnings.warn(
-                ("%f was not found for this charge state "
-                 "scoring model. Defaulting to uniform model") % neighborhood)
-            return UniformChargeStateScoringModel().score(chromatogram, *args, **kwargs)
-        bins = self.table[neighborhood]
+    def handle_missing_bin(self, chromatogram, bins, key, neighborhood, *args, **kwargs):
+        warnings.warn("%d not found for this mass range (%f). Using bin average (%r)" % (
+            key, neighborhood, chromatogram.charge_states))
+        return sum(bins.values()) / float(len(bins))
 
-        bin_sign = get_sign(tuple(bins)[0])
-        chrom_sign = get_sign(tuple(chromatogram.charge_states)[0])
-        if bin_sign != chrom_sign:
-            chrom_sign = -1
-        else:
-            chrom_sign = 1
-
-        for charge in chromatogram.charge_states:
-            charge = chrom_sign * charge
-            try:
-                total += bins[charge]
-            except KeyError:
-                warnings.warn("%d not found for this mass range (%f). Using bin average (%r, %r)" % (
-                    charge, neighborhood, bin_sign, chromatogram.charge_states))
-                total += sum(bins.values()) / float(len(bins))
-        total = min(total, 1.0)
-        return total
+    def transform_state(self, state):
+        return abs(state)
 
     @classmethod
     def fit(cls, observations, missing=0.01, neighborhood_width=100., ignore_singly_charged=False):
         bins = defaultdict(lambda: defaultdict(float))
 
+        self = cls({})
+
         for sol in observations:
-            neighborhood = neighborhood_of(sol.neutral_mass, neighborhood_width)
+            neighborhood = self.neighborhood_of(sol.neutral_mass)
             for c in sol.charge_states:
                 if ignore_singly_charged and abs(c) == 1:
                     continue
@@ -98,8 +102,7 @@ class MassScalingChargeStateScoringModel(ChargeStateDistributionScoringModelBase
 
         for neighborhood, counts in bins.items():
             for c in all_states:
-                if counts[c] == 0:
-                    counts[c] = missing
+                counts[c] += missing
             total = sum(counts.values())
             entry = {k: v / total for k, v in counts.items()}
             model_table[neighborhood] = entry
@@ -107,20 +110,18 @@ class MassScalingChargeStateScoringModel(ChargeStateDistributionScoringModelBase
         return cls(model_table, neighborhood_width)
 
     def save(self, file_obj):
-        import json
         json.dump(
             {"neighborhood_width": self.neighborhood_width, "table": self.table},
             file_obj, indent=4, sort_keys=True)
 
     @classmethod
     def load(cls, file_obj):
-        import json
         data = json.load(file_obj)
         table = data.pop("table")
         width = float(data.pop("neighborhood_width"))
 
         def numeric_keys(table, dtype=float, convert_value=lambda x: x):
-            return {dtype(k): convert_value(v) for k, v in table.items()}
+            return {abs(dtype(k)): convert_value(v) for k, v in table.items()}
 
         table = numeric_keys(table, convert_value=lambda x: numeric_keys(x, int))
 

@@ -23,9 +23,7 @@ class EntitySummaryBarChartArtist(ArtistBase):
         self.chromatograms = [c for c in chromatograms if c.glycan_composition is not None]
 
     def sort_items(self):
-        return sorted(
-            self.chromatograms, lambda x, y: NGlycanCompositionOrderer(
-                x.glycan_composition, y.glycan_composition))
+        return NGlycanCompositionOrderer.sort(self.chromatograms, key=lambda x: x.glycan_composition)
 
     def get_heights(self, items, **kwargs):
         raise NotImplementedError()
@@ -38,6 +36,9 @@ class EntitySummaryBarChartArtist(ArtistBase):
         self.ax.xaxis.set_ticks_position('none')
         self.ax.set_title(self.plot_title, fontsize=28)
         self.ax.set_ylabel(self.y_label, fontsize=28)
+
+    def __len__(self):
+        return len(self.sort_items())
 
     def prepare_x_args(self):
         items = self.sort_items()

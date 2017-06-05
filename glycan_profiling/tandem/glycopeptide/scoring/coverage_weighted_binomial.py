@@ -1,6 +1,4 @@
-from ...spectrum_matcher_base import SpectrumMatcherBase
-
-from .binomial_score import BinomialSpectrumMatcher, binomial_intensity, binomial_fragments_matched
+from .binomial_score import BinomialSpectrumMatcher
 from .simple_score import SimpleCoverageScorer
 from .fragment_match_map import FragmentMatchMap
 
@@ -16,7 +14,9 @@ class CoverageWeightedBinomialScorer(BinomialSpectrumMatcher, SimpleCoverageScor
         spectrum = self.spectrum
         n_theoretical = 0
         backbone_mass_series = []
+        neutral_losses = tuple(kwargs.pop("neutral_losses", []))
 
+        oxonium_ion_matches = set()
         for frag in self.target.glycan_fragments(
                 all_series=False, allow_ambiguous=False,
                 include_large_glycan_fragments=False,
@@ -24,31 +24,36 @@ class CoverageWeightedBinomialScorer(BinomialSpectrumMatcher, SimpleCoverageScor
             peak = spectrum.has_peak(frag.mass, error_tolerance)
             if peak:
                 solution_map.add(peak, frag)
+                oxonium_ion_matches.add(peak)
                 try:
                     self._sanitized_spectrum.remove(peak)
                 except KeyError:
                     continue
 
         n_glycosylated_b_ions = 0
-        for frags in self.target.get_fragments('b'):
+        for frags in self.target.get_fragments('b', neutral_losses):
             glycosylated_position = False
             n_theoretical += 1
             for frag in frags:
                 backbone_mass_series.append(frag)
                 glycosylated_position |= frag.is_glycosylated
                 for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
+                    if peak in oxonium_ion_matches:
+                        continue
                     solution_map.add(peak, frag)
             if glycosylated_position:
                 n_glycosylated_b_ions += 1
 
         n_glycosylated_y_ions = 0
-        for frags in self.target.get_fragments('y'):
+        for frags in self.target.get_fragments('y', neutral_losses):
             glycosylated_position = False
             n_theoretical += 1
             for frag in frags:
                 backbone_mass_series.append(frag)
                 glycosylated_position |= frag.is_glycosylated
                 for peak in spectrum.all_peaks_for(frag.mass, error_tolerance):
+                    if peak in oxonium_ion_matches:
+                        continue
                     solution_map.add(peak, frag)
             if glycosylated_position:
                 n_glycosylated_y_ions += 1

@@ -8,6 +8,8 @@ from scipy.ndimage import gaussian_filter1d
 
 from ms_peak_picker import search
 
+from .base import ScoringFeatureBase, epsilon
+
 
 class PeakShapeModelBase(object):
     def __repr__(self):
@@ -103,7 +105,9 @@ class BiGaussianModel(PeakShapeModelBase):
         return center, apex, sigma, sigma
 
 
-class ChromatogramShapeFitterBase(object):
+class ChromatogramShapeFitterBase(ScoringFeatureBase):
+    feature_type = "line_score"
+
     def __init__(self, chromatogram, smooth=True, fitter=PenalizedSkewedGaussianModel()):
         self.chromatogram = chromatogram
         self.smooth = smooth
@@ -150,6 +154,10 @@ class ChromatogramShapeFitterBase(object):
     @property
     def fit_parameters(self):
         raise NotImplementedError()
+
+    @classmethod
+    def score(cls, chromatogram, *args, **kwargs):
+        return max(1 - cls(chromatogram).line_test, epsilon)
 
 
 class ChromatogramShapeFitter(ChromatogramShapeFitterBase):

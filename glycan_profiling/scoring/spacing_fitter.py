@@ -1,11 +1,15 @@
 import numpy as np
 
+from .base import ScoringFeatureBase, epsilon
+
 
 def total_intensity(peaks):
     return sum(p.intensity for p in peaks)
 
 
-class ChromatogramSpacingFitter(object):
+class ChromatogramSpacingFitter(ScoringFeatureBase):
+    feature_type = "spacing_fit"
+
     def __init__(self, chromatogram):
         self.chromatogram = chromatogram
         self.rt_deltas = []
@@ -32,7 +36,11 @@ class ChromatogramSpacingFitter(object):
         self.rt_deltas = np.array(self.rt_deltas, dtype=np.float16)
         self.intensity_deltas = np.array(self.intensity_deltas, dtype=np.float32)
 
-        self.score = np.average(self.rt_deltas, weights=self.intensity_deltas / self.intensity_deltas.sum())
+        self.score = np.average(self.rt_deltas, weights=self.intensity_deltas)
 
     def __repr__(self):
         return "ChromatogramSpacingFitter(%s, %0.4f)" % (self.chromatogram, self.score)
+
+    @classmethod
+    def score(cls, chromatogram, *args, **kwargs):
+        return max(1 - cls(chromatogram).score * 2, epsilon)

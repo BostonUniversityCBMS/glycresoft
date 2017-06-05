@@ -1,7 +1,7 @@
 import logging
 try:
     logger = logging.getLogger("target_decoy")
-except:
+except Exception:
     pass
 from collections import defaultdict, namedtuple
 
@@ -39,6 +39,9 @@ class NearestValueLookUp(object):
         array = self.items
         lo = 0
         hi = len(array) - 1
+
+        if lo == hi:
+            return lo
 
         while hi - lo:
             i = (hi + lo) / 2

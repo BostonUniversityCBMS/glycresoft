@@ -1,14 +1,18 @@
 from itertools import product
+from collections import deque
 
 from glypy import GlycanComposition as MemoryGlycanComposition
+from glypy.composition.glycan_composition import FrozenMonosaccharideResidue
+from glypy.io.iupac import IUPACError
 from glycan_profiling.serialize.hypothesis.glycan import GlycanComposition as DBGlycanComposition
 
 from glypy.composition import formula
 
 from .glycan_source import (
     GlycanTransformer, GlycanHypothesisSerializerBase, GlycanCompositionToClass)
-from .symbolic_expression import (
-    ConstraintExpression, Solution)
+from glycan_profiling.symbolic_expression import (
+    ConstraintExpression, SymbolContext, SymbolNode, ExpressionNode,
+    ensuretext)
 
 
 def descending_combination_counter(counter):
@@ -17,6 +21,10 @@ def descending_combination_counter(counter):
         lo_hi[0], lo_hi[1] + 1), counter.values())
     for combination in product(*count_ranges):
         yield dict(zip(keys, combination))
+
+
+def normalize_iupac_lite(string):
+    return str(FrozenMonosaccharideResidue.from_iupac_lite(string))
 
 
 class CombinatoricCompositionGenerator(object):
@@ -49,7 +57,7 @@ class CombinatoricCompositionGenerator(object):
                  structure_classifiers=None):
         if structure_classifiers is None:
             structure_classifiers = {"N-Glycan": is_n_glycan_classifier}
-        self.residue_list = residue_list or []
+        self.residue_list = list(map(normalize_iupac_lite, (residue_list or [])))
         self.lower_bound = lower_bound or []
         self.upper_bound = upper_bound or []
         self.constraints = constraints or []
@@ -62,7 +70,28 @@ class CombinatoricCompositionGenerator(object):
 
         if rules_table is None:
             self._build_rules_table()
+
+        self.normalize_rules_table()
+        for constraint in self.constraints:
+            self.normalize_symbols(constraint.expression)
+
         self._iter = None
+
+    def normalize_rules_table(self):
+        rules_table = {}
+        for key, bounds in self.rules_table.items():
+            rules_table[normalize_iupac_lite(key)] = bounds
+        self.rules_table = rules_table
+
+    def normalize_symbols(self, expression):
+        symbol_stack = deque([expression])
+        while symbol_stack:
+            node = symbol_stack.popleft()
+            if isinstance(node, ExpressionNode):
+                symbol_stack.append(node.left)
+                symbol_stack.append(node.right)
+            elif isinstance(node, SymbolNode):
+                node.symbol = normalize_iupac_lite(node.symbol)
 
     def _build_rules_table(self):
         rules_table = {}
@@ -76,7 +105,7 @@ class CombinatoricCompositionGenerator(object):
     def generate(self):
         for combin in descending_combination_counter(self.rules_table):
             passed = True
-            combin = Solution(combin)
+            combin = SymbolContext(combin)
             structure_classes = []
             for constraint in self.constraints:
                 if not constraint(combin):
@@ -86,7 +115,10 @@ class CombinatoricCompositionGenerator(object):
                 for name, classifier in self.structure_classifiers.items():
                     if classifier(combin):
                         structure_classes.append(name)
-                yield MemoryGlycanComposition(**combin.context), structure_classes
+                try:
+                    yield MemoryGlycanComposition(**combin.context), structure_classes
+                except IUPACError:
+                    raise
 
     __iter__ = generate
 
@@ -123,6 +155,7 @@ class CombinatorialGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
         structure_class_lookup = self.structure_class_loader
         acc = []
         self.log("Generating Glycan Compositions from Symbolic Rules for %r" % self.hypothesis)
+        counter = 0
         for composition, structure_classes in self.transformer:
             mass = composition.mass()
             composition_string = composition.serialize()
@@ -131,6 +164,7 @@ class CombinatorialGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
                 calculated_mass=mass, formula=formula_string,
                 composition=composition_string,
                 hypothesis_id=self.hypothesis_id)
+            counter += 1
             self.session.add(inst)
             self.session.flush()
             for structure_class in structure_classes:
@@ -143,6 +177,7 @@ class CombinatorialGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
             self.session.execute(GlycanCompositionToClass.insert(), acc)
             acc = []
         self.session.commit()
+        self.log("Generated %d glycan compositions" % counter)
 
 
 def tryopen(obj):
@@ -175,34 +210,47 @@ def parse_rules_from_file(path):
     constraints = []
     stream = tryopen(path)
 
+    i = 0
+
     def cast(parts):
         return parts[0], int(parts[1]), int(parts[2])
 
     for line in stream:
+        i += 1
+        line = ensuretext(line)
+
         if line.startswith(";"):
             continue
         parts = line.replace("\n", "").split(" ")
-        if len(parts) == 3:
-            ranges.append(cast(parts))
-        elif len(parts) == 1:
-            if parts[0] in ["\n", "\r", ""]:
-                break
-            else:
-                raise Exception("Could not interpret line '%r'" % parts)
+        try:
+            if len(parts) == 3:
+                ranges.append(cast(parts))
+            elif len(parts) == 1:
+                if parts[0] in ["\n", "\r", ""]:
+                    break
+                else:
+                    raise Exception("Could not interpret line '%r' at line %d" % (parts, i))
+        except Exception as e:
+            raise Exception("Failed to interpret line %r at line %d (%r)" % (parts, i, e))
 
     for line in stream:
-        if line.startswith("#"):
+        i += 1
+        line = ensuretext(line)
+        if line.startswith(";"):
             continue
         line = line.replace("\n", "")
         if line in ["\n", "\r", ""]:
             break
-        constraints.append(ConstraintExpression.parse(line))
+        try:
+            constraints.append(ConstraintExpression.parse(line))
+        except Exception as e:
+            raise Exception("Failed to interpret line %r at line %d (%r)" % (line, i, e))            
 
     rules_table = CombinatoricCompositionGenerator.build_rules_table(
         *zip(*ranges))
     try:
         stream.close()
-    except:
+    except Exception:
         pass
     return rules_table, constraints
 
@@ -244,7 +292,7 @@ class ClassificationConstraint(object):
 
         Parameters
         ----------
-        context : Solution
+        context : SymbolContext
 
         Returns
         -------

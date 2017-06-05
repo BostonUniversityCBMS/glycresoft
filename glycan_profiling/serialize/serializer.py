@@ -2,23 +2,34 @@ from collections import defaultdict
 from uuid import uuid4
 
 from ms_deisotope.output.db import (
-    Base, DeconvolutedPeak, MSScan, Mass, HasUniqueName, PrecursorInformation,
-    SampleRun, DatabaseScanDeserializer, DatabaseBoundOperation)
+    MSScan,
+    DatabaseScanDeserializer,
+    DatabaseBoundOperation)
 
 from glycan_profiling.task import TaskBase
 
 from .analysis import Analysis
 from .chromatogram import (
     Chromatogram,
-    MassShiftSerializer, CompositionGroupSerializer, ChromatogramSolution,
-    GlycanCompositionChromatogram, UnidentifiedChromatogram)
+    MassShiftSerializer,
+    CompositionGroupSerializer,
+    ChromatogramSolution,
+    GlycanCompositionChromatogram,
+    UnidentifiedChromatogram,
+    ChromatogramSolutionAdductedToChromatogramSolution)
+
+from .hypothesis import (
+    GlycanComposition,
+    GlycanCombinationGlycanComposition,
+    GlycanCombination,
+    Glycopeptide)
 
 from .tandem import (
     GlycopeptideSpectrumCluster)
 
 from .identification import (
-    AmbiguousGlycopeptideGroup, IdentifiedGlycopeptide,
-    Glycopeptide)
+    AmbiguousGlycopeptideGroup,
+    IdentifiedGlycopeptide)
 
 
 class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
@@ -36,6 +47,7 @@ class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
         self._composition_cache = CompositionGroupSerializer(session)
         self._node_peak_map = dict()
         self._scan_id_map = self._build_scan_id_map()
+        self._chromatogram_solution_id_map = dict()
 
     def __repr__(self):
         return "AnalysisSerializer(%s, %d)" % (self.analysis.name, self.analysis_id)
@@ -109,6 +121,10 @@ class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
             composition_cache=self._composition_cache,
             scan_lookup_table=self._scan_id_map,
             node_peak_map=self._node_peak_map)
+        try:
+            self._chromatogram_solution_id_map[solution.id] = result.id
+        except AttributeError:
+            pass
         if commit:
             self.commit()
         return result
@@ -121,6 +137,11 @@ class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
             composition_cache=self._composition_cache,
             scan_lookup_table=self._scan_id_map,
             node_peak_map=self._node_peak_map)
+        try:
+            self._chromatogram_solution_id_map[solution.id] = result.solution.id
+        except AttributeError:
+            pass
+
         if commit:
             self.commit()
         return result
@@ -133,6 +154,11 @@ class AnalysisSerializer(DatabaseBoundOperation, TaskBase):
             composition_cache=self._composition_cache,
             scan_lookup_table=self._scan_id_map,
             node_peak_map=self._node_peak_map)
+        try:
+            self._chromatogram_solution_id_map[solution.id] = result.solution.id
+        except AttributeError:
+            pass
+
         if commit:
             self.commit()
         return result
@@ -247,6 +273,17 @@ class AnalysisDeserializer(DatabaseBoundOperation):
             IdentifiedGlycopeptide.analysis_id == self.analysis_id).yield_per(100)
         gps = [c.convert() for c in q]
         return gps
+
+    def load_glycans_from_identified_glycopeptides(self):
+        q = self.query(GlycanComposition).join(
+            GlycanCombinationGlycanComposition).join(GlycanCombination).join(
+            Glycopeptide,
+            Glycopeptide.glycan_combination_id == GlycanCombination.id).join(
+            IdentifiedGlycopeptide,
+            IdentifiedGlycopeptide.structure_id == Glycopeptide.id).filter(
+            IdentifiedGlycopeptide.analysis_id == self.analysis_id)
+        gcs = [c for c in q]
+        return gcs
 
 
 class AnalysisDestroyer(DatabaseBoundOperation):

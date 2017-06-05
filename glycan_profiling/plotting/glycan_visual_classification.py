@@ -5,13 +5,21 @@ from matplotlib import patches as mpatches
 from glypy.composition.glycan_composition import FrozenGlycanComposition, FrozenMonosaccharideResidue
 from glycopeptidepy.utils import simple_repr
 
+from glycan_profiling.database.composition_network import (
+    CompositionRangeRule,
+    CompositionRuleClassifier,
+    CompositionRatioRule,
+    normalize_composition)
+
+from glycan_profiling import symbolic_expression
+
 
 def _degree_monosaccharide_alteration(x):
     try:
         if not isinstance(x, FrozenMonosaccharideResidue):
             x = FrozenMonosaccharideResidue.from_iupac_lite(str(x))
         return (len(x.modifications), len(x.substituent_links))
-    except:
+    except Exception:
         return (float('inf'), float('inf'))
 
 
@@ -27,6 +35,54 @@ class GlycanCompositionOrderer(object):
             for residue in self.priority_residues
         ]
 
+        outer = self
+
+        class _ComparableProxy(object):
+            def __init__(self, composition, obj=None):
+                if isinstance(composition, basestring):
+                    composition = FrozenGlycanComposition.parse(composition)
+                if obj is None:
+                    obj = composition
+                self.composition = composition
+                self.obj = obj
+
+            def __iter__(self):
+                return iter(self.composition)
+
+            def __getitem__(self, key):
+                return self.composition[key]
+
+            def __lt__(self, other):
+                return outer(self, other) < 0
+
+            def __gt__(self, other):
+                return outer(self, other) > 0
+
+            def __eq__(self, other):
+                return outer(self, other) == 0
+
+            def __le__(self, other):
+                return outer(self, other) <= 0
+
+            def __ge__(self, other):
+                return outer(self, other) >= 0
+
+            def __ne__(self, other):
+                return outer(self, other) != 0
+
+        self._comparable_proxy = _ComparableProxy
+
+    def sort(self, compositions, key=None, reverse=False):
+        if key is None:
+
+            def key(x):
+                return x
+
+        proxies = [self._comparable_proxy(key(c), c) for c in compositions]
+        proxies = sorted(proxies, reverse=reverse)
+        out = [p.obj for p in proxies]
+        return out
+
     def key_order(self, keys):
         keys = list(keys)
         for r in reversed(self.priority_residues):
@@ -40,8 +96,8 @@ class GlycanCompositionOrderer(object):
 
     def __call__(self, a, b):
         if isinstance(a, basestring):
-            a = FrozenGlycanComposition.parse(a)
-            b = FrozenGlycanComposition.parse(b)
+            a = normalize_composition(a)
+            b = normalize_composition(b)
         keys = self.key_order(sorted(set(a) | set(b), key=self.sorter))
 
         for key in keys:
@@ -52,60 +108,6 @@ class GlycanCompositionOrderer(object):
             else:
                 continue
         return 0
-
-    __repr__ = simple_repr
-
-
-class CompositionRangeRule(object):
-    def __init__(self, name, low=None, high=None, required=True):
-        self.name = name
-        self.low = low
-        self.high = high
-        self.required = required
-
-    __repr__ = simple_repr
-
-    def get_composition(self, obj):
-        try:
-            composition = obj.glycan_composition
-        except:
-            composition = FrozenGlycanComposition.parse(obj)
-        return composition
-
-    def __call__(self, obj):
-        composition = self.get_composition(obj)
-        if self.name in composition:
-            if self.low is None:
-                return composition[self.name] <= self.high
-            elif self.high is None:
-                return self.low <= composition[self.name]
-            return self.low <= composition[self.name] <= self.high
-        else:
-            return not self.required
-
-
-class CompositionRuleClassifier(object):
-    def __init__(self, name, rules):
-        self.name = name
-        self.rules = rules
-
-    def __iter__(self):
-        return iter(self.rules)
-
-    def __call__(self, obj):
-        for rule in self:
-            if not rule(obj):
-                return False
-        return True
-
-    def __eq__(self, other):
-        return self.name == other.name
-
-    def __ne__(self, other):
-        return not self == other
-
-    def __hash__(self):
-        return hash(self.name)
 
     __repr__ = simple_repr
 
@@ -121,6 +123,7 @@ class GlycanCompositionClassifierColorizer(object):
         self.default = default
 
     def __call__(self, obj):
+        obj = normalize_composition(obj)
         for rule, color in self.rule_color_map.items():
             if rule(obj):
                 return color
@@ -145,14 +148,19 @@ class GlycanCompositionClassifierColorizer(object):
 
 
 NGlycanCompositionColorizer = GlycanCompositionClassifierColorizer(OrderedDict([
+    (CompositionRuleClassifier("Paucimannose", [
+        CompositionRangeRule("HexNAc", 2, 2) & CompositionRangeRule("Hex", 0, 4)]), "#f05af0"),
     (CompositionRuleClassifier("High Mannose", [CompositionRangeRule("HexNAc", 2, 2)]), '#1f77b4'),
     (CompositionRuleClassifier("Hybrid", [CompositionRangeRule("HexNAc", 3, 3)]), '#ff7f0e'),
     (CompositionRuleClassifier("Bi-Antennerary", [CompositionRangeRule("HexNAc", 4, 4)]), '#2ca02c'),
     (CompositionRuleClassifier("Tri-Antennerary", [CompositionRangeRule("HexNAc", 5, 5)]), '#d62728'),
     (CompositionRuleClassifier("Tetra-Antennerary", [CompositionRangeRule("HexNAc", 6, 6)]), '#9467bd'),
     (CompositionRuleClassifier("Penta-Antennerary", [CompositionRangeRule("HexNAc", 7, 7)]), '#8c564b'),
-    (CompositionRuleClassifier("Supra-Penta-Antennerary", [CompositionRangeRule("HexNAc", 8)]), 'brown')
-]))
+    (CompositionRuleClassifier("Supra-Penta-Antennerary", [CompositionRangeRule("HexNAc", 8)]), 'brown'),
+    (CompositionRuleClassifier("Low Sulfate GAG", [CompositionRatioRule("HexN", "@sulfate", (0, 2))]), "#2aaaaa"),
+    (CompositionRuleClassifier("High Sulfate GAG", [CompositionRatioRule("HexN", "@sulfate", (2, 4))]), "#88faaa")
+]), default="slateblue")
+
 NGlycanCompositionOrderer = GlycanCompositionOrderer(["HexNAc", "Hex", "Fucose", "NeuAc"])
 
 _null_color_chooser = GlycanCompositionClassifierColorizer({}, default='blue')
@@ -169,7 +177,7 @@ class GlycanLabelTransformer(object):
         residues = set()
         for item in self._input_series:
             if isinstance(item, basestring):
-                item = FrozenGlycanComposition.parse(item)
+                item = normalize_composition(item)
             residues.update(item)
 
         residues = sorted(residues, key=_degree_monosaccharide_alteration)
@@ -178,7 +186,7 @@ class GlycanLabelTransformer(object):
     def transform(self):
         for item in self._input_series:
             if isinstance(item, basestring):
-                item = FrozenGlycanComposition.parse(item)
+                item = normalize_composition(item)
             counts = [str(item[r]) for r in self.residues]
             yield '[%s]' % '; '.join(counts)
 

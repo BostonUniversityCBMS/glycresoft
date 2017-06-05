@@ -73,7 +73,7 @@ def analyze():
 def search_glycopeptide(context, database_connection, sample_path, hypothesis_identifier,
                         analysis_name, output_path=None, grouping_error_tolerance=1.5e-5, mass_error_tolerance=1e-5,
                         msn_mass_error_tolerance=2e-5, psm_fdr_threshold=0.05, peak_shape_scoring_model=None,
-                        tandem_scoring_model=None, oxonium_threshold=0.05,
+                        tandem_scoring_model=None, oxonium_threshold=0.15,
                         save_intermediate_results=None, processes=4):
     """Identify glycopeptide sequences from preprocessed LC-MS/MS data, stored in mzML
     format.
@@ -91,7 +91,7 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
     try:
         hypothesis = get_by_name_or_id(
             database_connection, GlycopeptideHypothesis, hypothesis_identifier)
-    except:
+    except Exception:
         click.secho("Could not locate a Glycopeptide Hypothesis with identifier %r" %
                     hypothesis_identifier, fg='yellow')
         raise click.Abort()
@@ -128,7 +128,7 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
         import cPickle as pickle
         analyzer.log("Saving Intermediate Results")
         with open(save_intermediate_results, 'wb') as handle:
-            pickle.dump((target_hits, decoy_hits), handle)
+            pickle.dump((target_hits, decoy_hits, gps), handle)
 
 
 @analyze.command("search-glycan", short_help=('Search preprocessed data for'
@@ -159,7 +159,7 @@ def search_glycan(context, database_connection, sample_path,
                   hypothesis_identifier,
                   analysis_name, adducts, grouping_error_tolerance=1.5e-5,
                   mass_error_tolerance=1e-5, minimum_mass=500.,
-                  scoring_model=None,
+                  scoring_model=None, network_sharing=0.2,
                   output_path=None):
     """Identify glycan compositions from preprocessed LC-MS data, stored in mzML
     format.
@@ -176,7 +176,7 @@ def search_glycan(context, database_connection, sample_path,
     try:
         hypothesis = get_by_name_or_id(
             database_connection, GlycanHypothesis, hypothesis_identifier)
-    except:
+    except Exception:
         click.secho("Could not locate a Glycan Hypothesis with identifier %r" %
                     hypothesis_identifier, fg='yellow')
         raise click.Abort()
@@ -189,9 +189,10 @@ def search_glycan(context, database_connection, sample_path,
     adducts = [validate_adduct(adduct, multiplicity)
                for adduct, multiplicity in adducts]
     expanded = []
-    for adduct, mult in adducts:
-        for i in range(1, mult + 1):
-            expanded.append(adduct * i)
+    # for adduct, mult in adducts:
+    #     for i in range(1, mult + 1):
+    #         expanded.append(adduct * i)
+    expanded = MzMLGlycanChromatogramAnalyzer.expand_adducts(dict(adducts))
     adducts = expanded
 
     click.secho("Preparing analysis of %s by %s" %
@@ -202,6 +203,6 @@ def search_glycan(context, database_connection, sample_path,
         sample_path=sample_path, output_path=output_path, adducts=adducts,
         mass_error_tolerance=mass_error_tolerance,
         grouping_error_tolerance=grouping_error_tolerance, scoring_model=scoring_model,
-        minimum_mass=minimum_mass,
+        minimum_mass=minimum_mass, network_sharing=network_sharing,
         analysis_name=analysis_name)
     analyzer.start()

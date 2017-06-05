@@ -1,4 +1,3 @@
-from multiprocessing import Queue, Event
 
 from glycan_profiling.serialize import func
 from glycan_profiling.serialize.hypothesis.peptide import Peptide, Protein
@@ -144,6 +143,7 @@ class MultipleProcessFastaGlycopeptideHypothesisSerializer(FastaGlycopeptideHypo
     def glycosylate_peptides(self):
         dispatcher = MultipleProcessPeptideGlycosylator(
             self._original_connection, self.hypothesis_id,
+            glycan_combination_count=self.total_glycan_combination_count,
             n_processes=self.n_processes)
         dispatcher.process(self.peptide_ids())
 

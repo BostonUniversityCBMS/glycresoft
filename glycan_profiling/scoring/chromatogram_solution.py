@@ -1,33 +1,93 @@
-import time
-from collections import namedtuple
+from collections import namedtuple, OrderedDict
 from operator import mul
 try:
     reduce
-except:
+except NameError:
     from functools import reduce
 
 import numpy as np
 
-from .shape_fitter import ChromatogramShapeFitter, AdaptiveMultimodalChromatogramShapeFitter
+from .shape_fitter import AdaptiveMultimodalChromatogramShapeFitter
 from .spacing_fitter import ChromatogramSpacingFitter
 from .charge_state import UniformChargeStateScoringModel
 from .isotopic_fit import IsotopicPatternConsistencyFitter
+from .base import symbolic_composition
 
-from glypy.composition.glycan_composition import FrozenGlycanComposition
-
+from glycan_profiling import symbolic_expression
 from glycan_profiling.chromatogram_tree import ChromatogramInterface
+from glycopeptidepy import HashableGlycanComposition
 
 
 epsilon = 1e-6
 
 scores = namedtuple("scores", ["line_score", "isotopic_fit", "spacing_fit", "charge_count"])
+scores_adducted = namedtuple(
+    "scores_adducted",
+    ["line_score", "isotopic_fit", "spacing_fit", "charge_count",
+     "adduct_score"])
+
+
+def logit(x):
+    return np.log(x) - np.log(1 - x)
+
+
+def logitsum(xs):
+    total = 0
+    for x in xs:
+        total += logit(x)
+    return total
 
 
 def prod(*x):
     return reduce(mul, x, 1)
 
 
-class DummyScorer(object):
+class ScorerBase(object):
+    def __init__(self, *args, **kwargs):
+        self.feature_set = OrderedDict()
+
+    def add_feature(self, scoring_feature):
+        if scoring_feature is None:
+            return
+        feature_type = scoring_feature.get_feature_type()
+        self.feature_set[feature_type] = scoring_feature
+
+    def features(self):
+        for feature in self.feature_set.values():
+            yield feature
+
+    def compute_scores(self, chromatogram):
+        raise NotImplementedError()
+
+    def logitscore(self, chromatogram):
+        score = logitsum(self.compute_scores(chromatogram))
+        return score
+
+    def score(self, chromatogram):
+        score = reduce(mul, self.compute_scores(chromatogram), 1.0)
+        return score
+
+
+class ChromatogramScoreSet(object):
+    def __init__(self, scores):
+        self.scores = OrderedDict(scores)
+
+    def __iter__(self):
+        return iter(self.scores.values())
+
+    def __repr__(self):
+        return "%s(%s)" % (self.__class__.__name__, str(self.scores)[1:-1])
+
+    def __getattr__(self, key):
+        if key == "scores":
+            raise AttributeError(key)
+        return self.scores[key]
+
+    def items(self):
+        return self.scores.items()
+
+
+class DummyScorer(ScorerBase):
     def __init__(*args, **kwargs):
         pass
 
@@ -46,34 +106,50 @@ class DummyScorer(object):
     def mean_fit(self):
         return 0.0
 
+    def compute_scores(self, chromatogram):
+        line_score = 1 - epsilon
+        isotopic_fit = 1 - epsilon
+        spacing_fit = 1 - epsilon
+        charge_count = 1 - epsilon
+        return ChromatogramScoreSet([
+            ("line_score", line_score), ("isotopic_fit", isotopic_fit),
+            ("spacing_fit", spacing_fit), ("charge_count", charge_count)
+        ])
 
-class ChromatogramScorer(object):
+    def logitscore(self, chromatogram):
+        score = logitsum(self.compute_scores(chromatogram))
+        return score
+
+
+class ChromatogramScorer(ScorerBase):
     def __init__(self, shape_fitter_type=AdaptiveMultimodalChromatogramShapeFitter,
                  isotopic_fitter_type=IsotopicPatternConsistencyFitter,
                  charge_scoring_model=UniformChargeStateScoringModel(),
-                 spacing_fitter_type=ChromatogramSpacingFitter):
-        self.shape_fitter_type = shape_fitter_type
-        self.isotopic_fitter_type = isotopic_fitter_type
-        self.spacing_fitter_type = spacing_fitter_type
-        self.charge_scoring_model = charge_scoring_model
+                 spacing_fitter_type=ChromatogramSpacingFitter,
+                 adduct_scoring_model=None, *models):
+        super(ChromatogramScorer, self).__init__()
+        self.add_feature(shape_fitter_type)
+        self.add_feature(isotopic_fitter_type)
+        self.add_feature(spacing_fitter_type)
+        self.add_feature(charge_scoring_model)
+        self.add_feature(adduct_scoring_model)
+        for model in models:
+            self.add_feature(model)
 
     def compute_scores(self, chromatogram):
-        line_score = max(1 - self.shape_fitter_type(chromatogram).line_test, epsilon)
-        isotopic_fit = max(1 - self.isotopic_fitter_type(chromatogram).mean_fit, epsilon)
-        spacing_fit = max(1 - self.spacing_fitter_type(chromatogram).score * 2, epsilon)
-        charge_count = self.charge_scoring_model.score(chromatogram)
-        return scores(line_score, isotopic_fit, spacing_fit, charge_count)
-
-    def score(self, chromatogram):
-        score = reduce(mul, self.compute_scores(chromatogram), 1.0)
-        return score
+        scores = []
+        for model in self.features():
+            scores.append((model.get_feature_type(), model.score(chromatogram)))
+        return ChromatogramScoreSet(scores)
 
     def clone(self):
-        return self.__class__(
-            self.shape_fitter_type, self.isotopic_fitter_type, self.charge_scoring_model, self.spacing_fitter_type)
+        dup = self.__class__()
+        for feature in self.features():
+            dup.add_feature(feature)
+        return dup
 
 
-class ModelAveragingScorer(object):
+class ModelAveragingScorer(ScorerBase):
     def __init__(self, models, weights=None):
         if weights is None:
             weights = [1.0 for i in range(len(models))]
@@ -94,14 +170,11 @@ class ModelAveragingScorer(object):
             score_set.append(np.array(score) * weight)
         return scores(*sum(score_set, np.zeros_like(score_set[0])))
 
-    def score(self, chromatogram):
-        return prod(*self.compute_scores(chromatogram))
-
     def clone(self):
         return self.__class__(list(self.models), list(self.weights))
 
 
-class CompositionDispatchScorer(object):
+class CompositionDispatchScorer(ScorerBase):
     def __init__(self, rule_model_map, default_model=None):
         if default_model is None:
             default_model = ChromatogramScorer()
@@ -112,13 +185,9 @@ class CompositionDispatchScorer(object):
         return self.__class__({k: v.clone() for k, v in self.rule_model_map.items()}, self.default_model.clone())
 
     def get_composition(self, obj):
-        # if isinstance(obj.composition, basestring):
-        #     composition = FrozenGlycanComposition.parse(obj.composition)
-        # else:
-        #     composition = obj.composition
         if obj.composition is not None:
             if obj.glycan_composition is not None:
-                return obj.glycan_composition
+                return symbolic_composition(obj)
         return None
 
     def find_model(self, composition):
@@ -134,10 +203,6 @@ class CompositionDispatchScorer(object):
         composition = self.get_composition(chromatogram)
         model = self.find_model(composition)
         return model.compute_scores(chromatogram)
-
-    def score(self, chromatogram):
-        score = reduce(mul, self.compute_scores(chromatogram), 1.0)
-        return score
 
 
 class ChromatogramSolution(object):
@@ -171,6 +236,10 @@ class ChromatogramSolution(object):
 
     def score_components(self):
         return self.scorer.compute_scores(self.chromatogram)
+
+    @property
+    def logitscore(self):
+        return self.scorer.logitscore(self.chromatogram)
 
     def get_chromatogram(self):
         return self.chromatogram

@@ -5,9 +5,9 @@ from ms_deisotope.averagine import glycan, PROTON, mass_charge_ratio
 from ms_peak_picker.peak_set import FittedPeak
 from brainpy import isotopic_variants
 
-import glypy
-
 from glycan_profiling.chromatogram_tree import Unmodified
+
+from .base import ScoringFeatureBase, epsilon
 
 
 def envelope_to_peak_list(envelope):
@@ -46,7 +46,9 @@ def unspool_nodes(node):
             yield x
 
 
-class IsotopicPatternConsistencyFitter(object):
+class IsotopicPatternConsistencyFitter(ScoringFeatureBase):
+    feature_type = "isotopic_fit"
+
     def __init__(self, chromatogram, averagine=glycan, charge_carrier=PROTON):
         self.chromatogram = chromatogram
         self.averagine = averagine
@@ -59,7 +61,6 @@ class IsotopicPatternConsistencyFitter(object):
             if chromatogram.elemental_composition is not None:
                 self.composition = chromatogram.elemental_composition
             else:
-                # self.composition = glypy.GlycanComposition.parse(chromatogram.composition).total_composition()
                 raise Exception(chromatogram.composition)
         else:
             self.composition = None
@@ -110,4 +111,8 @@ class IsotopicPatternConsistencyFitter(object):
                 self.intensity.append(peak.intensity)
         self.intensity = np.array(self.intensity)
         self.scores = np.array(self.scores)
-        self.mean_fit = np.average(self.scores, weights=self.intensity / self.intensity.sum())
+        self.mean_fit = np.average(self.scores, weights=self.intensity)
+
+    @classmethod
+    def score(cls, chromatogram, *args, **kwargs):
+        return max(1 - cls(chromatogram).mean_fit, epsilon)

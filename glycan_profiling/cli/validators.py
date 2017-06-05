@@ -8,12 +8,16 @@ from sqlalchemy.exc import OperationalError
 from brainpy import periodic_table
 from ms_deisotope.averagine import (
     Averagine, glycan as n_glycan_averagine, permethylated_glycan,
-    peptide, glycopeptide)
+    peptide, glycopeptide, heparin)
 
 from glycan_profiling.serialize import (
     DatabaseBoundOperation, GlycanHypothesis, GlycopeptideHypothesis,
-    SampleRun, Analysis)
-from glycan_profiling.database.builder.glycan import GlycanCompositionHypothesisMerger
+    SampleRun, Analysis, AnalysisTypeEnum)
+
+from glycan_profiling.database.builder.glycan import (
+    GlycanCompositionHypothesisMerger,
+    named_reductions, named_derivatizations)
+
 from glycan_profiling.database.builder.glycopeptide.proteomics import mzid_proteome
 from glycan_profiling.chromatogram_tree import (
     MassShift, CompoundMassShift, Formate, Ammonium,
@@ -46,7 +50,7 @@ class ModificationValidator(object):
     def validate(self, modification_string):
         try:
             return self.table[modification_string]
-        except:
+        except KeyError:
             return False
 
 
@@ -93,6 +97,31 @@ class HypothesisGlycanSourceValidator(GlycanSourceValidatorBase):
             return inst is not None
 
 
+@glycan_source_validators("analysis")
+class GlycanAnalysisGlycanSourceValidator(GlycanSourceValidatorBase):
+    def __init__(self, database_connection, source, source_type, source_identifier=None):
+        super(GlycanAnalysisGlycanSourceValidator, self).__init__(
+            database_connection, source, source_type, source_identifier)
+        self.handle = DatabaseBoundOperation(source)
+
+    def validate(self):
+        if self.source_identifier is None:
+            click.secho("No value passed through --glycan-source-identifier.", fg='magenta')
+            return False
+        try:
+            analysis_id = int(self.source_identifier)
+            inst = self.handle.query(Analysis).filter(
+                Analysis.id == analysis_id,
+                Analysis.analysis_type == AnalysisTypeEnum.glycan_lc_ms.name)
+            return inst is not None
+        except TypeError:
+            hypothesis_name = self.source
+            inst = self.handle.query(Analysis).filter(
+                Analysis.name == hypothesis_name,
+                Analysis.analysis_type == AnalysisTypeEnum.glycan_lc_ms.name).first()
+            return inst is not None
+
+
 class GlycanHypothesisCopier(GlycanCompositionHypothesisMerger):
     pass
 
@@ -130,9 +159,31 @@ validate_sample_run_name = partial(validate_unique_name, klass=SampleRun)
 validate_analysis_name = partial(validate_unique_name, klass=Analysis)
 
 
+def _resolve_protein_name_list(context, args):
+    result = []
+    for arg in args:
+        if isinstance(arg, basestring):
+            if os.path.exists(arg) and os.path.isfile(arg):
+                with open(arg) as fh:
+                    for line in fh:
+                        cleaned = line.strip()
+                        if cleaned:
+                            result.append(cleaned)
+            else:
+                result.append(arg)
+        else:
+            if isinstance(arg, (list, tuple)):
+                result.extend(arg)
+            else:
+                result.append(arg)
+    return result
+
+
 def validate_mzid_proteins(context, mzid_file, target_proteins=tuple(), target_proteins_re=tuple()):
     all_proteins = set(mzid_proteome.protein_names(mzid_file))
     accepted_target_proteins = set()
+    target_proteins = _resolve_protein_name_list(context, target_proteins)
+    target_proteins_re = _resolve_protein_name_list(context, target_proteins_re)
     for prot in target_proteins:
         if prot in all_proteins:
             accepted_target_proteins.add(prot)
@@ -153,34 +204,33 @@ def validate_mzid_proteins(context, mzid_file, target_proteins=tuple(), target_p
     return list(accepted_target_proteins)
 
 
-named_reductions = {
-    'reduced': 'H2',
-    'deuteroreduced': 'HH[2]'
-}
-
-
 def validate_reduction(context, reduction_string):
     if reduction_string is None:
-        return True
+        return None
     try:
         if reduction_string in named_reductions:
-            return True
+            return named_reductions[reduction_string]
         else:
             if len(Composition(str(reduction_string))) > 0:
-                return True
-    except:
+                return str(reduction_string)
+            else:
+                raise Exception("Invalid")
+    except Exception:
         click.secho("Could not validate reduction '%s'" % reduction_string)
-        raise click.Abort()
+        raise click.Abort("Could not validate reduction '%s'" % reduction_string)
 
 
 def validate_derivatization(context, derivatization_string):
     if derivatization_string is None:
-        return True
+        return derivatization_string
+    if derivatization_string in named_derivatizations:
+        return named_derivatizations[derivatization_string]
     subst = Substituent(derivatization_string)
     if len(subst.composition) == 0:
         click.secho("Could not validate derivatization '%s'" % derivatization_string)
-        raise click.Abort()
-    return True
+        raise click.Abort("Could not validate derivatization '%s'" % derivatization_string)
+    else:
+        return derivatization_string
 
 
 def validate_element(element):
@@ -199,7 +249,8 @@ averagines = {
     'glycan': n_glycan_averagine,
     'permethylated-glycan': permethylated_glycan,
     'peptide': peptide,
-    'glycopeptide': glycopeptide
+    'glycopeptide': glycopeptide,
+    'heparin': heparin
 }
 
 
@@ -227,7 +278,7 @@ def validate_adduct(adduct_string, multiplicity=1):
             shift = MassShift(adduct_string, composition)
             return (shift, multiplicity)
         except Exception as e:
-            print(e)
+            click.secho("%r" % (e,))
             click.secho("Could not validate adduct %s" % (adduct_string,), fg='yellow')
             raise click.Abort()
 

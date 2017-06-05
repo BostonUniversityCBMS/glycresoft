@@ -110,6 +110,7 @@ def group_by_precursor_mass(scans, window_size=1.5e-5):
 
 
 class SpectrumMatchBase(object):
+    __slots__ = ['scan', 'target']
 
     def __init__(self, scan, target):
         self.scan = scan
@@ -133,6 +134,9 @@ class SpectrumMatchBase(object):
         theoretical = self.target.total_composition().mass
         return (observed - theoretical) / theoretical
 
+    def __reduce__(self):
+        return self.__class__, (self.scan, self.target)
+
     def __eq__(self, other):
         try:
             target_id = self.target.id
@@ -154,6 +158,7 @@ class SpectrumMatchBase(object):
 
 
 class SpectrumMatcherBase(SpectrumMatchBase):
+    __slots__ = ["spectrum", "_score"]
 
     def __init__(self, scan, target):
         self.scan = scan
@@ -177,6 +182,15 @@ class SpectrumMatcherBase(SpectrumMatchBase):
         inst.match(*args, **kwargs)
         inst.calculate_score(*args, **kwargs)
         return inst
+
+    def __getstate__(self):
+        return (self.score,)
+
+    def __setstate__(self, state):
+        self.score = state[0]
+
+    def __reduce__(self):
+        return self.__class__, (self.scan, self.target,)
 
     @staticmethod
     def load_peaks(scan):
@@ -206,7 +220,10 @@ class DeconvolutingSpectrumMatcherBase(SpectrumMatcherBase):
 
 class SpectrumMatch(SpectrumMatchBase):
 
-    def __init__(self, scan, target, score, best_match=False, data_bundle=None):
+    __slots__ = ['scan', 'target', 'score', 'best_match', 'data_bundle', "q_value", 'id']
+
+    def __init__(self, scan, target, score, best_match=False, data_bundle=None,
+                 q_value=None, id=None):
         if data_bundle is None:
             data_bundle = dict()
         self.scan = scan
@@ -214,12 +231,18 @@ class SpectrumMatch(SpectrumMatchBase):
         self.score = score
         self.best_match = best_match
         self.data_bundle = data_bundle
+        self.q_value = q_value
+        self.id = id
 
     def clear_caches(self):
         try:
             self.target.clear_caches()
         except AttributeError:
             pass
+
+    def __reduce__(self):
+        return self.__class__, (self.scan, self.target, self.score, self.best_match,
+                                self.data_bundle, self.q_value, self.id)
 
     def evaluate(self, scorer_type, *args, **kwargs):
         if isinstance(self.scan, SpectrumReference):
@@ -240,16 +263,29 @@ class SpectrumSolutionSet(object):
 
     def __init__(self, scan, solutions):
         self.scan = scan
-        # self.oxonium_ratio = oxonium_detector(scan.deconvoluted_peak_set)
         self.solutions = solutions
         self.mean = self._score_mean()
         self.variance = self._score_variance()
         self._is_simplified = False
         self._is_top_only = False
+        self._target_map = None
+
+    def _invalidate(self):
+        self._target_map = None
 
     @property
     def score(self):
         return self.best_solution().score
+
+    def _make_target_map(self):
+        self._target_map = {
+            sol.target: sol for sol in self
+        }
+
+    def solution_for(self, target):
+        if self._target_map is None:
+            self._make_target_map()
+        return self._target_map[target]
 
     def precursor_ion_mass(self):
         neutral_mass = self.scan.precursor_information.extracted_neutral_mass
@@ -305,6 +341,7 @@ class SpectrumSolutionSet(object):
         self.solutions = [
             x for x in self if x.score >= thresh
         ]
+        self._invalidate()
         return self
 
     def simplify(self):
@@ -322,6 +359,7 @@ class SpectrumSolutionSet(object):
             solutions.append(sm)
         self.solutions = solutions
         self._is_simplified = True
+        self._invalidate()
 
     def get_top_solutions(self):
         score = self.best_solution().score
@@ -332,6 +370,7 @@ class SpectrumSolutionSet(object):
             return
         self.solutions = self.get_top_solutions()
         self._is_top_only = True
+        self._invalidate()
 
 
 class TandemClusterEvaluatorBase(TaskBase):
@@ -412,7 +451,7 @@ class TandemClusterEvaluatorBase(TaskBase):
                     hit_to_scan[hit.id].append(scan)
                     hit_map[hit.id] = hit
             if report:
-                self.log("... Mapping Segment Done. (%d candidates)" % (j,))
+                self.log("... Mapping Segment Done. (%d spectrum-pairs)" % (j,))
         return scan_map, hit_map, hit_to_scan
 
     def _evaluate_hit_groups_single_process(self, scan_map, hit_map, hit_to_scan, *args, **kwargs):
@@ -459,7 +498,7 @@ class TandemClusterEvaluatorBase(TaskBase):
         return dispatcher.process(scan_map, hit_map, hit_to_scan)
 
     def _evaluate_hit_groups(self, scan_map, hit_map, hit_to_scan, **kwargs):
-        if self.n_processes == 1 or len(hit_map) < 100:
+        if self.n_processes == 1 or len(hit_map) < 500:
             return self._evaluate_hit_groups_single_process(
                 scan_map, hit_map, hit_to_scan, **kwargs)
         else:
@@ -619,6 +658,11 @@ class IdentificationProcessDispatcher(TaskBase):
         feeder_thread.start()
         return feeder_thread
 
+    def _reconstruct_missing_work_items(self, seen, hit_map, hit_to_scan):
+        missing = set(hit_to_scan) - set(seen)
+        for missing_id in missing:
+            pass
+
     def process(self, scan_map, hit_map, hit_to_scan):
         feeder_thread = self.spawn_queue_feeder(
             hit_map, hit_to_scan)
@@ -641,18 +685,21 @@ class IdentificationProcessDispatcher(TaskBase):
             try:
                 target, score_map = self.output_queue.get(True, 2)
                 if target.id in seen:
-                    self.log("Duplicate Results For %s. First seen at %d, now again at %d" % (
-                        target.id, seen[target.id], i))
+                    self.log(
+                        "Duplicate Results For %s. First seen at %d, now again at %d" % (
+                            target.id, seen[target.id], i))
                 else:
                     seen[target.id] = i
                 if i > n:
-                    self.log("Warning: %d additional output received. %s and %d matches." % (
-                        i - n, target, len(score_map)))
+                    self.log(
+                        "Warning: %d additional output received. %s and %d matches." % (
+                            i - n, target, len(score_map)))
 
                 i += 1
                 strikes = 0
                 if i % 1000 == 0:
-                    self.log("...... Processed %d matches (%0.2f%%)" % (i, i * 100. / n))
+                    self.log(
+                        "...... Processed %d matches (%0.2f%%)" % (i, i * 100. / n))
             except QueueEmptyException:
                 if self.all_workers_finished():
                     if len(seen) == n:
@@ -660,10 +707,12 @@ class IdentificationProcessDispatcher(TaskBase):
                     else:
                         strikes += 1
                         if strikes % 50 == 0:
-                            self.log("...... %d cycles without output (%d/%d, %0.2f%% Done)" % (
-                                strikes, len(seen), n, len(seen) * 100. / n))
+                            self.log(
+                                "...... %d cycles without output (%d/%d, %0.2f%% Done)" % (
+                                    strikes, len(seen), n, len(seen) * 100. / n))
                         if strikes > 1e4:
-                            self.log("...... Too much time has elapsed with missing items. Breaking.")
+                            self.log(
+                                "...... Too much time has elapsed with missing items. Breaking.")
                             has_work = False
                 continue
             target.clear_caches()

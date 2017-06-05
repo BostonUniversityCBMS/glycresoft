@@ -18,23 +18,28 @@ from glypy import ReducedEnd
 class TextFileGlycanCompositionLoader(object):
     def __init__(self, file_object):
         self.file_object = file_object
+        self.current_line = 0
 
     def _process_line(self):
         line = next(self.file_object)
         line = line.strip()
-        while line == '':
-            line = next(self.file_object)
-            line = line.strip()
-        tokens = re.split(r"(?:\t|\s{2,})", line)
-        if len(tokens) == 1:
-            composition, structure_classes = tokens[0], ()
-        elif len(tokens) == 2:
-            composition, structure_classes = tokens
-            structure_classes = [structure_classes]
-        else:
-            composition = tokens[0]
-            structure_classes = tokens[1:]
-        gc = glycan_composition.GlycanComposition.parse(composition)
+        self.current_line += 1
+        try:
+            while line == '':
+                line = next(self.file_object)
+                line = line.strip()
+            tokens = re.split(r"(?:\t|\s{2,})", line)
+            if len(tokens) == 1:
+                composition, structure_classes = tokens[0], ()
+            elif len(tokens) == 2:
+                composition, structure_classes = tokens
+                structure_classes = [structure_classes]
+            else:
+                composition = tokens[0]
+                structure_classes = tokens[1:]
+            gc = glycan_composition.GlycanComposition.parse(composition)
+        except Exception as e:
+            raise Exception("Parsing Error %r occurred at %d" % (e, self.current_line))
         return gc, structure_classes
 
     def __next__(self):
@@ -83,6 +88,17 @@ class GlycanClassLoader(object):
 
     def __getitem__(self, name):
         return self.get(name)
+
+
+named_reductions = {
+    'reduced': 'H2',
+    'deuteroreduced': 'HH[2]'
+}
+
+
+named_derivatizations = {
+    "permethylated": "methyl"
+}
 
 
 class GlycanTransformer(object):
@@ -168,6 +184,7 @@ class TextFileGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
         self.log("Loading Glycan Compositions from Stream for %r" % self.hypothesis)
 
         acc = []
+        counter = 0
         for composition, structure_classes in self.transformer:
             mass = composition.mass()
             composition_string = composition.serialize()
@@ -178,6 +195,7 @@ class TextFileGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
                 hypothesis_id=self.hypothesis_id)
             self.session.add(inst)
             self.session.flush()
+            counter += 1
             for structure_class in structure_classes:
                 structure_class = structure_class_lookup[structure_class]
                 acc.append(dict(glycan_id=inst.id, class_id=structure_class.id))
@@ -188,6 +206,7 @@ class TextFileGlycanHypothesisSerializer(GlycanHypothesisSerializerBase):
             self.session.execute(GlycanCompositionToClass.insert(), acc)
             acc = []
         self.session.commit()
+        self.log("Generated %d glycan compositions" % counter)
 
 
 class GlycanCompositionHypothesisMerger(GlycanHypothesisSerializerBase):

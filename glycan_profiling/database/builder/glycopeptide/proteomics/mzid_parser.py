@@ -23,10 +23,53 @@ class MultipleProteinInfoDict(dict):
     multi = None
 
 
-class Parser(MzIdentML):
+class MissingProteinException(Exception):
+    pass
 
+
+class MissingPeptideEvidenceHandler(object):
+    parser = re.compile(
+        r"(?P<evidence_id>PEPTIDEEVIDENCE_(?P<peptide_id>PEPTIDE_\d+)_(?P<parent_accession>DBSEQUENCE_.+))")
+
+    def __init__(self, full_id):
+        self.full_id = full_id
+
+    def __repr__(self):
+        return "MissingPeptideEvidenceHandler(%r)" % (self.full_id,)
+
+    def reconstruct_evidence(self):
+        match = self.parser.search(self.full_id)
+        if match is None:
+            raise ValueError("Cannot interpret %r" % (self.full_id,))
+        data = match.groupdict()
+        result = {
+            "isDecoy": False,
+            "end": None,
+            "start": None,
+            "peptide_ref": data["peptide_id"],
+            "dBSequence_ref": data['parent_accession'],
+            'pre': None,
+            "post": None,
+            "id": self.full_id
+        }
+        return result
+
+    @classmethod
+    def recover(cls, full_id):
+        inst = cls(full_id)
+        return inst.reconstruct_evidence()
+
+
+class Parser(MzIdentML):
     def _handle_ref(self, info, key, value):
-        info.update(self.get_by_id(value, retrieve_refs=True))
+        try:
+            referenced = self.get_by_id(value, retrieve_refs=True)
+        except AttributeError:
+            if key == "peptideEvidence_ref":
+                referenced = MissingPeptideEvidenceHandler.recover(value)
+            else:
+                raise AttributeError(key)
+        info.update(referenced)
         del info[key]
         info.pop('id', None)
 
@@ -90,7 +133,11 @@ class Parser(MzIdentML):
         infos = [info]
         # resolve refs
         if kwargs.get('retrieve_refs'):
-            _, multi = self._retrieve_refs(info, **kwargs)
+            try:
+                _, multi = self._retrieve_refs(info, **kwargs)
+            except ValueError as e:
+                print(info, e, kwargs)
+                raise e
             if multi is not None:
                 info.multi = multi
             if info.multi:

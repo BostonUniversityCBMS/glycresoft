@@ -5,9 +5,11 @@ from glycan_profiling.config.config_file import (
     add_user_modification_rule as add_user_peptide_modification_rule,
     add_user_substituent_rule)
 
+from glypy.composition import formula
 
 from glycopeptidepy.structure.modification import (
-    extract_targets_from_string, ModificationRule, Composition)
+    extract_targets_from_string, ModificationRule, Composition,
+    Modification)
 
 
 @cli.group(short_help='Set persistent configuration options')
@@ -39,6 +41,17 @@ def peptide_modification(name, composition, target, categories=None):
     click.echo("Added %r to modification registry" % (rule,))
 
 
+@config.command("get-peptide-modification")
+@click.argument("name")
+def display_peptide_modification(name):
+    mod = Modification(name)
+    click.echo("name: %s" % mod.name)
+    click.echo("mass: %f" % mod.mass)
+    click.echo("formula: %s" % formula(mod.composition))
+    for target in mod.rule.targets:
+        click.echo("target: %s" % target.serialize())
+
+
 @config.command("add-substituent")
 @click.option("-n", "--name", required=True, help='Substituent name')
 @click.option("-c", "--composition", required=True, help='The chemical formula for this substituent')
@@ -49,8 +62,8 @@ def peptide_modification(name, composition, target, categories=None):
 @click.option("-a", "--attachment-loss", default="H",
               help="The composition lost by the parent molecule when this substituent is added. Defaults to \"H\"")
 def substituent(name, composition, is_nh_derivatizable, can_nh_derivatize, attachment_loss):
-    print(name)
-    print(composition)
-    print(is_nh_derivatizable)
-    print(can_nh_derivatize)
-    print(attachment_loss)
+    click.echo("name: %s" % (name,))
+    click.echo("composition: %s" % (composition,))
+    click.echo("is_nh_derivatizable: %s" % (is_nh_derivatizable,))
+    click.echo("can_nh_derivatize: %s" % (can_nh_derivatize,))
+    click.echo("attachment_loss: %s" % (attachment_loss,))
