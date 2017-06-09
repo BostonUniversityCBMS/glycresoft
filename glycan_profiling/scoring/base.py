@@ -1,4 +1,8 @@
 import numpy as np
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 from abc import ABCMeta, abstractmethod
 from six import add_metaclass
 
@@ -36,6 +40,28 @@ class ScoringFeatureBase(object):
             return name
 
 
+class DummyFeature(ScoringFeatureBase):
+    def __init__(self, name, feature_type):
+        self.name = name
+        self.feature_type = feature_type
+
+    def score(self, chromatogram, *args, **kwargs):
+        return 0.985
+
+    def get_feature_type(self):
+        return self.feature_type
+
+    def get_feature_name(self):
+        name = getattr(self, "name", None)
+        if name is None:
+            return "%s:%s" % (self.get_feature_type(), self.__name__)
+        else:
+            return name
+
+    def clone(self):
+        return self
+
+
 @add_metaclass(ABCMeta)
 class DiscreteCountScoringModelBase(object):
     def __init__(self, *args, **kwargs):
@@ -45,11 +71,11 @@ class DiscreteCountScoringModelBase(object):
         return 0
 
     def save(self, file_obj):
-        pass
+        pickle.dump(self, file_obj)
 
     @classmethod
     def load(cls, file_obj):
-        return cls()
+        return pickle.load(file_obj)
 
     @abstractmethod
     def get_state_count(self, chromatogram):
@@ -60,6 +86,12 @@ class DiscreteCountScoringModelBase(object):
     def get_states(self, chromatogram):
         # Returns a list enumerating the states
         # this entity was observed in
+        raise NotImplementedError()
+
+    @abstractmethod
+    def get_signal_proportions(self, chromatogram):
+        # Returns a mapping from state to proportion of
+        # total signal observed in state
         raise NotImplementedError()
 
 
@@ -84,6 +116,9 @@ class DecayRateCountScoringModelBase(DiscreteCountScoringModelBase):
         k = self.get_state_count(chromatogram)
         return decay(k, self.step, self.rate) - epsilon
 
+    def clone(self):
+        return self.__class__(self.step, self.rate)
+
 
 class LogarithmicCountScoringModelBase(DiscreteCountScoringModelBase):
     def __init__(self, steps=5):
@@ -99,6 +134,9 @@ class LogarithmicCountScoringModelBase(DiscreteCountScoringModelBase):
         # as `log(1) = 0`
         k = self.get_state_count(chromatogram) + 1
         return self._logarithmic_change_of_base(k) - epsilon
+
+    def clone(self):
+        return self.__class__(self.base)
 
 
 def ones(x):
@@ -161,8 +199,11 @@ class MassScalingCountScoringModel(DiscreteCountScoringModelBase):
         total = max(min(total, 1.0) - epsilon, epsilon)
         return total
 
+    def clone(self):
+        return self.__class__(self.table, self.neighborhood_width)
 
-class CompositionDispatchingModel(object):
+
+class CompositionDispatchingModel(ScoringFeatureBase):
     def __init__(self, rule_model_map, default_model):
         self.rule_model_map = rule_model_map
         self.default_model = default_model
@@ -186,6 +227,18 @@ class CompositionDispatchingModel(object):
         composition = self.get_composition(chromatogram)
         model = self.find_model(composition)
         return model.score(chromatogram, *args, **kwargs)
+
+    def get_feature_type(self):
+        return self.default_model.get_feature_type()
+
+    def get_feature_name(self):
+        return "%s:%s(%s)" % (
+            self.get_feature_type(), self.__class__.__name__,
+            ", ".join([v.get_feature_name()
+                       for v in self.rule_model_map.values()]))
+
+    def clone(self):
+        return self.__class__(self.rule_model_map, self.default_model)
 
 
 neuac = FMR.from_iupac_lite("NeuAc")

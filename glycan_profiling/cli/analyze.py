@@ -23,7 +23,9 @@ from .validators import (
     validate_analysis_name,
     validate_adduct, validate_glycopeptide_tandem_scoring_function,
     glycopeptide_tandem_scoring_functions,
-    get_by_name_or_id)
+    get_by_name_or_id,
+    validate_ms1_feature_name,
+    ms1_model_features)
 
 
 def make_analysis_output_path(prefix):
@@ -155,12 +157,18 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
 @click.option("-s", "--network-sharing", default=0.2, type=float,
               help="The weight to place on similar compositions' confidence for evaluating"
                    " one composition's confidence.")
+@click.option("-f", "--ms1-scoring-feature", "scoring_model_features", multiple=True,
+              type=click.Choice(sorted(ms1_model_features)),
+              help="Additional features to include in evaluating chromatograms")
+@click.option("-r", "--delta-rt", default=0.25, type=float,
+              help='The maximum time between observed data points before splitting features')
 def search_glycan(context, database_connection, sample_path,
                   hypothesis_identifier,
                   analysis_name, adducts, grouping_error_tolerance=1.5e-5,
                   mass_error_tolerance=1e-5, minimum_mass=500.,
                   scoring_model=None, network_sharing=0.2,
-                  output_path=None):
+                  output_path=None, scoring_model_features=None,
+                  delta_rt=0.25):
     """Identify glycan compositions from preprocessed LC-MS data, stored in mzML
     format.
     """
@@ -168,6 +176,10 @@ def search_glycan(context, database_connection, sample_path,
         output_path = make_analysis_output_path("glycan")
     if scoring_model is None:
         scoring_model = GeneralScorer
+
+    if scoring_model_features:
+        for feature in scoring_model_features:
+            scoring_model.add_feature(validate_ms1_feature_name(feature))
 
     database_connection = DatabaseBoundOperation(database_connection)
     ms_data = ProcessedMzMLDeserializer(sample_path, use_index=False)
@@ -189,9 +201,6 @@ def search_glycan(context, database_connection, sample_path,
     adducts = [validate_adduct(adduct, multiplicity)
                for adduct, multiplicity in adducts]
     expanded = []
-    # for adduct, mult in adducts:
-    #     for i in range(1, mult + 1):
-    #         expanded.append(adduct * i)
     expanded = MzMLGlycanChromatogramAnalyzer.expand_adducts(dict(adducts))
     adducts = expanded
 
@@ -204,5 +213,5 @@ def search_glycan(context, database_connection, sample_path,
         mass_error_tolerance=mass_error_tolerance,
         grouping_error_tolerance=grouping_error_tolerance, scoring_model=scoring_model,
         minimum_mass=minimum_mass, network_sharing=network_sharing,
-        analysis_name=analysis_name)
+        analysis_name=analysis_name, delta_rt=delta_rt)
     analyzer.start()
