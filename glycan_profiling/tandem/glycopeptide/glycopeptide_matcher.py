@@ -3,12 +3,11 @@ from collections import defaultdict, namedtuple, OrderedDict
 from glycan_profiling.chromatogram_tree.chromatogram import GlycopeptideChromatogram
 from glycan_profiling.task import TaskBase
 
-from glycan_profiling.serialize import (
-    DatabaseBoundOperation, DatabaseScanDeserializer, func,
-    MSScan, PrecursorInformation)
+from glycan_profiling.serialize import DatabaseBoundOperation
 
 from glycan_profiling.database.disk_backed_database import (
     GlycopeptideDiskBackedStructureDatabase)
+
 from glycan_profiling.database.mass_collection import ConcatenatedDatabase
 
 from .scoring import TargetDecoyAnalyzer
@@ -17,7 +16,6 @@ from glycan_profiling.database.structure_loader import (
 
 from ..spectrum_matcher_base import (
     TandemClusterEvaluatorBase, gscore_scanner,
-    IdentificationProcessDispatcher,
     SpectrumIdentificationWorkerBase, Manager as IPCManager)
 from ..chromatogram_mapping import ChromatogramMSMSMapper
 
@@ -106,14 +104,19 @@ class TargetDecoyInterleavingGlycopeptideMatcher(TandemClusterEvaluatorBase):
         decoy_result = self.decoy_evaluator.score_one(scan, precursor_error_tolerance, *args, **kwargs)
         return target_result, decoy_result
 
-    def score_bunch(self, scans, precursor_error_tolerance=1e-5, *args, **kwargs):
+    def score_bunch(self, scans, precursor_error_tolerance=1e-5, simplify=True, *args, **kwargs):
         # Map scans to target database
-        scan_map, hit_map, hit_to_scan = self.target_evaluator._map_scans_to_hits(scans, precursor_error_tolerance)
+        scan_map, hit_map, hit_to_scan = self.target_evaluator._map_scans_to_hits(
+            scans, precursor_error_tolerance)
         # Evaluate mapped target hits
         target_scan_solution_map = self.target_evaluator._evaluate_hit_groups(
             scan_map, hit_map, hit_to_scan, *args, **kwargs)
         # Aggregate and reduce target solutions
         target_solutions = self._collect_scan_solutions(target_scan_solution_map, scan_map)
+        if simplify:
+            for case in target_solutions:
+                case.simplify()
+                case.select_top()
 
         # Reuse mapped hits from target database using the decoy evaluator
         # since this assumes that the decoys will be direct reversals of
@@ -122,6 +125,10 @@ class TargetDecoyInterleavingGlycopeptideMatcher(TandemClusterEvaluatorBase):
             scan_map, hit_map, hit_to_scan, *args, **kwargs)
         # Aggregate and reduce target solutions
         decoy_solutions = self._collect_scan_solutions(decoy_scan_solution_map, scan_map)
+        if simplify:
+            for case in decoy_solutions:
+                case.simplify()
+                case.select_top()
         return target_solutions, decoy_solutions
 
     def score_all(self, precursor_error_tolerance=1e-5, simplify=False, *args, **kwargs):
@@ -129,7 +136,9 @@ class TargetDecoyInterleavingGlycopeptideMatcher(TandemClusterEvaluatorBase):
         decoy_out = []
 
         self.filter_for_oxonium_ions()
-        target_out, decoy_out = self.score_bunch(self.tandem_cluster, precursor_error_tolerance, *args, **kwargs)
+        target_out, decoy_out = self.score_bunch(
+            self.tandem_cluster, precursor_error_tolerance,
+            simplify=simplify, *args, **kwargs)
         if simplify:
             for case in target_out:
                 case.simplify()
@@ -141,10 +150,10 @@ class TargetDecoyInterleavingGlycopeptideMatcher(TandemClusterEvaluatorBase):
 
 
 class CompetativeTargetDecoyInterleavingGlycopeptideMatcher(TargetDecoyInterleavingGlycopeptideMatcher):
-    def score_bunch(self, scans, precursor_error_tolerance=1e-5, *args, **kwargs):
+    def score_bunch(self, scans, precursor_error_tolerance=1e-5, simplify=True, *args, **kwargs):
         target_solutions, decoy_solutions = super(
             CompetativeTargetDecoyInterleavingGlycopeptideMatcher, self).score_bunch(
-            scans, precursor_error_tolerance, *args, **kwargs)
+            scans, precursor_error_tolerance, simplify, *args, **kwargs)
         target_solutions = OrderedDict([(s.scan.id, s) for s in target_solutions])
         decoy_solutions = OrderedDict([(s.scan.id, s) for s in target_solutions])
 
@@ -179,7 +188,7 @@ class ComparisonGlycopeptideMatcher(TargetDecoyInterleavingGlycopeptideMatcher):
             [], self.scorer_type, self.decoy_structure_database,
             n_processes=n_processes, ipc_manager=ipc_manager)
 
-    def score_bunch(self, scans, precursor_error_tolerance=1e-5, *args, **kwargs):
+    def score_bunch(self, scans, precursor_error_tolerance=1e-5, simplify=True, *args, **kwargs):
         # Map scans to target database
         scan_map, hit_map, hit_to_scan = self.target_evaluator._map_scans_to_hits(scans, precursor_error_tolerance)
         # Evaluate mapped target hits
@@ -244,6 +253,20 @@ def format_identification(spectrum_solution):
         spectrum_solution.scan.precursor_information.neutral_mass,
         spectrum_solution.best_solution().score,
         spectrum_solution.best_solution().target)
+
+
+def format_identification_batch(group, n):
+    representers = dict()
+    group = sorted(group, key=lambda x: x.score, reverse=True)
+    for ident in group:
+        key = str(ident.best_solution().target)
+        if key in representers:
+            continue
+        else:
+            representers[key] = ident
+    to_represent = sorted(
+        representers.values(), key=lambda x: x.score, reverse=True)
+    return '\n'.join(map(format_identification, to_represent[:n]))
 
 
 def format_work_batch(bunch, count, total):
@@ -323,7 +346,7 @@ class GlycopeptideDatabaseSearchIdentifier(TaskBase):
             target_hits.extend(o for o in t if o.score > 0)
             decoy_hits.extend(o for o in d if o.score > 0)
             t = sorted(t, key=lambda x: x.score, reverse=True)
-            self.log("......\n%s" % ('\n'.join(map(format_identification, t[:4]))))
+            self.log("......\n%s" % (format_identification_batch(t, 10)))
             if count >= limit:
                 self.log("Reached Limit. Halting.")
                 break

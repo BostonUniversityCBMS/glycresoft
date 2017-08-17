@@ -15,6 +15,23 @@ epsilon = 1e-6
 
 
 def symbolic_composition(obj):
+    """Extract the glycan composition from *obj* and converts it
+    into an instance of :class:`.GlycanSymbolContext`
+
+    The extraction process first attempts to access *obj.glycan_composition*
+    but on an :class:`AttributeError` calls :meth:`.HashableGlycanComposition.parse`
+    on *obj*. The resulting :class:`.GlycanComposition` object is then passed
+    to :class:`.GlycanSymbolContext`
+
+    Parameters
+    ----------
+    obj : object
+        The object to convert
+
+    Returns
+    -------
+    GlycanSymbolContext
+    """
     try:
         composition = obj.glycan_composition
     except AttributeError:
@@ -24,6 +41,10 @@ def symbolic_composition(obj):
 
 
 class ScoringFeatureBase(object):
+    """A base class for a type that either on instantiation
+    or on invokation of :meth:`score` will produce a confidence
+    metric for a (possibly annotated) chromatogram
+    """
     name = None
     feature_type = None
 
@@ -38,6 +59,15 @@ class ScoringFeatureBase(object):
             return "%s:%s" % (self.get_feature_type(), self.__name__)
         else:
             return name
+
+    @classmethod
+    def reject(self, score_components):
+        score = score_components[self.get_feature_type()]
+        return score < 0.15
+
+    @classmethod
+    def configure(cls, analysis_data):
+        return {}
 
 
 class DummyFeature(ScoringFeatureBase):
@@ -70,7 +100,7 @@ class DiscreteCountScoringModelBase(object):
     def score(self, chromatogram, *args, **kwargs):
         return 0
 
-    def save(self, file_obj):
+    def dump(self, file_obj):
         pickle.dump(self, file_obj)
 
     @classmethod
@@ -93,6 +123,10 @@ class DiscreteCountScoringModelBase(object):
         # Returns a mapping from state to proportion of
         # total signal observed in state
         raise NotImplementedError()
+
+    def reject(self, score_components):
+        score = score_components[self.feature_type]
+        return score < 0.15
 
 
 class UniformCountScoringModelBase(DiscreteCountScoringModelBase):
@@ -203,6 +237,38 @@ class MassScalingCountScoringModel(DiscreteCountScoringModelBase):
         return self.__class__(self.table, self.neighborhood_width)
 
 
+class ProportionBasedMassScalingCountScoringModel(MassScalingCountScoringModel):
+
+    def kullback_leibler_divergence(self, observed, expected):
+        total = 0
+        for key in expected:
+            try:
+                observed_frequency = observed[key]
+            except KeyError:
+                observed_frequency = 1e-3
+            total += observed_frequency * (np.log(observed_frequency) - np.log(expected[key]))
+        return total
+
+    def expnorm_kl(self, observed, expected):
+        return 1 - np.exp(-self.kullback_leibler_divergence(observed, expected))
+
+    def score(self, chromatogram, *args, **kwargs):
+        neighborhood = self.get_neighborhood_key(chromatogram.neutral_mass)
+        if neighborhood not in self.table:
+            return self.handle_missing_neighborhood(
+                chromatogram, neighborhood, *args, **kwargs)
+
+        model_bin = self.table[neighborhood]
+        observed_dist = dict()
+
+        for key, proportion in self.get_signal_proportions(chromatogram):
+            key = self.transform_state(key)
+            observed_dist[key] = proportion
+        score = self.expnorm_kl(observed_dist, model_bin)
+        score = max(min(score, 1.0) - epsilon, epsilon)
+        return score
+
+
 class CompositionDispatchingModel(ScoringFeatureBase):
     def __init__(self, rule_model_map, default_model):
         self.rule_model_map = rule_model_map
@@ -236,6 +302,10 @@ class CompositionDispatchingModel(ScoringFeatureBase):
             self.get_feature_type(), self.__class__.__name__,
             ", ".join([v.get_feature_name()
                        for v in self.rule_model_map.values()]))
+
+    def reject(self, score_components):
+        score = score_components[self.get_feature_type()]
+        return score < 0.15
 
     def clone(self):
         return self.__class__(self.rule_model_map, self.default_model)

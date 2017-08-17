@@ -1,5 +1,6 @@
 import os
 import re
+import traceback
 from functools import partial
 
 import click
@@ -21,7 +22,7 @@ from glycan_profiling.database.builder.glycan import (
 from glycan_profiling.database.builder.glycopeptide.proteomics import mzid_proteome
 from glycan_profiling.chromatogram_tree import (
     MassShift, Formate, Ammonium,
-    Sodiated)
+    Sodium, Potassium)
 
 from glycan_profiling.tandem.glycopeptide.scoring import (
     binomial_score, simple_score, coverage_weighted_binomial, SpectrumMatcherBase)
@@ -263,10 +264,20 @@ def validate_averagine(averagine_string):
         return parse_averagine_formula(averagine_string)
 
 
+class AveragineParamType(click.types.StringParamType):
+    name = "MODEL"
+
+    models = averagines
+
+    def convert(self, value, param, ctx):
+        return validate_averagine(value)
+
+
 adducts = {
     "ammonium": Ammonium,
     "formate": Formate,
-    "sodium": Sodiated,
+    "sodium": Sodium,
+    "potassium": Potassium,
 }
 
 
@@ -276,13 +287,14 @@ def validate_adduct(adduct_string, multiplicity=1):
         return (adducts[adduct_string.lower()], multiplicity)
     else:
         try:
+            adduct_string = str(adduct_string)
             composition = Composition(adduct_string)
             shift = MassShift(adduct_string, composition)
             return (shift, multiplicity)
         except Exception as e:
             click.secho("%r" % (e,))
-            click.secho("Could not validate adduct %s" % (adduct_string,), fg='yellow')
-            raise click.Abort()
+            click.secho("Could not validate adduct %r" % (adduct_string,), fg='yellow')
+            raise click.Abort("Could not validate adduct %r" % (adduct_string,))
 
 
 glycopeptide_tandem_scoring_functions = {
@@ -336,3 +348,31 @@ def validate_ms1_feature_name(feature_name):
         raise click.Abort(
             "Could not recognize scoring feature by name %r" % (
                 feature_name,))
+
+
+def strip_site_root(type, value, tb):
+    msg = traceback.format_exception(type, value, tb)
+    sanitized = []
+    for i, line in enumerate(msg):
+        if 'site-packages' in line:
+            sanitized.append(line.split("site-packages")[1])
+        else:
+            sanitized.append(line)
+    print(''.join(sanitized))
+
+
+class RelativeMassErrorParam(click.types.FloatParamType):
+    name = 'NUMBER'
+
+    def convert(self, value, param, ctx):
+        value = super(RelativeMassErrorParam, self).convert(value, param, ctx)
+        if value >= 1:
+            self.fail("mass error value must be less than 1, as "
+                      "in parts-per-million error tolerance (e.g. 1e-5 for "
+                      "10 parts-per-million error tolerance)")
+        if value > 1e-3:
+            click.secho(
+                "Warning: %r has a relatively large margin, %f" % (
+                    getattr(param, "human_readable_name", param),
+                    value), fg='yellow')
+        return value

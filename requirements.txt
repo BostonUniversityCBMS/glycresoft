@@ -4,17 +4,19 @@ six
 sqlalchemy
 
 numpy
-matplotlib
 scipy
+matplotlib
 
 pyteomics
 lxml
 
 click
 
+jinja2
+
 rdflib
-SPARQLWrapper
 requests
+SPARQLWrapper
 
 glypy
 glycopeptidepy

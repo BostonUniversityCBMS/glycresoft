@@ -1,14 +1,16 @@
 import click
 import os
 
-from glycan_profiling.cli.base import cli, HiddenOption, processes_option
-from glycan_profiling.cli.validators import (
-    validate_averagine, validate_sample_run_name)
-
-import ms_deisotope
 import ms_peak_picker
+import ms_deisotope
 
 from ms_deisotope.processor import MSFileLoader
+
+from glycan_profiling.cli.base import cli, HiddenOption, processes_option
+from glycan_profiling.cli.validators import (
+    validate_averagine,
+    AveragineParamType)
+
 from glycan_profiling.profiler import (
     SampleConsumer,
     CentroidingSampleConsumer,
@@ -32,24 +34,29 @@ def rt_to_id(ms_file, rt):
 @mzml_cli.command("preprocess", short_help=(
     "Convert raw mass spectra data into deisotoped neutral mass peak lists written to mzML."
     " Can accept mzML or mzXML with either profile or centroided scans."))
-@click.argument("ms-file", type=click.Path(exists=True))
-@click.argument("outfile-path", type=click.Path(writable=True))
+@click.argument("ms-file", type=click.Path(exists=True), doc_help=(
+    "Path to an mass spectral data file in one of the supported formats"))
+@click.argument("outfile-path", type=click.Path(writable=True), doc_help=(
+    "Path to write the processed output to"))
 @click.option("-a", "--averagine", default='glycan',
-              help='Averagine model to use for MS1 scans. Either a name or formula.')
+              type=AveragineParamType(),
+              help='Averagine model to use for MS1 scans. Either a name or formula')
 @click.option("-an", "--msn-averagine", default='peptide',
-              help='Averagine model to use for MS^n scans. Either a name or formula.')
-@click.option("-s", "--start-time", type=float, default=0.0, help='Scan time to begin processing at')
-@click.option("-e", "--end-time", type=float, default=float('inf'), help='Scan time to stop processing at')
+              type=AveragineParamType(),
+              help='Averagine model to use for MS^n scans. Either a name or formula')
+@click.option("-s", "--start-time", type=float, default=0.0,
+              help='Scan time to begin processing at in minutes')
+@click.option("-e", "--end-time", type=float, default=float('inf'),
+              help='Scan time to stop processing at in minutes')
 @click.option("-c", "--maximum-charge", type=int, default=8,
-              help=('Highest charge state considered. '
-                    'Defaults to 8'))
+              help=('Highest absolute charge state to consider'))
 @click.option("-n", "--name", default=None,
               help="Name for the sample run to be stored. Defaults to the base name of the input mzML file")
-@click.option("-t", "--score-threshold", type=float, default=35.,
-              help="Minimum score to accept an isotopic pattern fit in an MS1 scan. Scales with intensity.")
-@click.option("-tn", "--msn-score-threshold", type=float, default=10.,
-              help="Minimum score to accept an isotopic pattern fit in an MS^n scan. Scales with intensity.")
-@click.option("-m", "--missed-peaks", type=int, default=1,
+@click.option("-t", "--score-threshold", type=float, default=SampleConsumer.MS1_SCORE_THRESHOLD,
+              help="Minimum score to accept an isotopic pattern fit in an MS1 scan")
+@click.option("-tn", "--msn-score-threshold", type=float, default=SampleConsumer.MSN_SCORE_THRESHOLD,
+              help="Minimum score to accept an isotopic pattern fit in an MS^n scan")
+@click.option("-m", "--missed-peaks", type=int, default=3,
               help="Number of missing peaks to permit before an isotopic fit is discarded")
 @click.option("-mn", "--msn-missed-peaks", type=int, default=1,
               help="Number of missing peaks to permit before an isotopic fit is discarded in an MSn scan")
@@ -77,6 +84,8 @@ def preprocess(ms_file, outfile_path, averagine=None, start_time=None, end_time=
                msn_missed_peaks=1, background_reduction=5., msn_background_reduction=0.,
                transform=None, msn_transform=None, processes=4, extract_only_tandem_envelopes=False,
                ignore_msn=False, profile=False, isotopic_strictness=2.0):
+    '''Convert raw mass spectra data into deisotoped neutral mass peak lists written to mzML.
+    '''
     if transform is None:
         transform = []
     if msn_transform is None:
@@ -86,7 +95,7 @@ def preprocess(ms_file, outfile_path, averagine=None, start_time=None, end_time=
         click.secho(
             "Cannot use both --ignore-msn and --extract-only-tandem-envelopes",
             fg='red')
-        raise click.Abort()
+        raise click.Abort("Cannot use both --ignore-msn and --extract-only-tandem-envelopes")
 
     cache_handler_type = ThreadedMzMLScanCacheHandler
     click.echo("Preprocessing %s" % ms_file)
@@ -118,9 +127,6 @@ def preprocess(ms_file, outfile_path, averagine=None, start_time=None, end_time=
     click.echo("from %s (%0.2f) to %s (%0.2f)" % (
         start_scan_id, start_time, end_scan_id, end_time))
     click.echo("charge range: %s" % (charge_range,))
-
-    averagine = validate_averagine(averagine)
-    msn_averagine = validate_averagine(msn_averagine)
 
     if is_profile:
         ms1_peak_picking_args = {
@@ -176,7 +182,8 @@ def preprocess(ms_file, outfile_path, averagine=None, start_time=None, end_time=
         storage_path=outfile_path, sample_name=name,
         start_scan_id=start_scan_id, cache_handler_type=cache_handler_type,
         end_scan_id=end_scan_id, n_processes=processes,
-        extract_only_tandem_envelopes=extract_only_tandem_envelopes)
+        extract_only_tandem_envelopes=extract_only_tandem_envelopes,
+        ignore_tandem_scans=ignore_msn)
     consumer.start()
 
 

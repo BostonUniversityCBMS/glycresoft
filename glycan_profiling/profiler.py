@@ -1,6 +1,8 @@
 import re
 import warnings
 
+import glypy
+
 from glycan_profiling.database.disk_backed_database import (
     GlycanCompositionDiskBackedStructureDatabase,
     GlycopeptideDiskBackedStructureDatabase)
@@ -18,16 +20,22 @@ from glycan_profiling.scoring import (
     ChromatogramSolution)
 
 from glycan_profiling.trace import (
-    ScanSink, ChromatogramExtractor,
-    ChromatogramProcessor)
+    ScanSink,
+    ChromatogramFilter,
+    ChromatogramExtractor,
+    LogitSumChromatogramProcessor,
+    LaplacianRegularizedChromatogramProcessor)
 
 from glycan_profiling.models import GeneralScorer
 
 from glycan_profiling.tandem import chromatogram_mapping
+from glycan_profiling.tandem.spectrum_matcher_base import ScanStub
 from glycan_profiling.tandem.glycopeptide.scoring import CoverageWeightedBinomialScorer
 from glycan_profiling.tandem.glycopeptide.glycopeptide_matcher import GlycopeptideDatabaseSearchIdentifier
 from glycan_profiling.tandem.glycopeptide import (
     identified_structure as identified_glycopeptide)
+from glycan_profiling.tandem.glycan.composition_matching import SignatureIonMapper
+from glycan_profiling.tandem.glycan.scoring.signature_ion_scoring import SignatureIonScorer
 
 
 from glycan_profiling.scan_cache import (
@@ -58,6 +66,9 @@ class SampleConsumer(TaskBase):
     MS1_IGNORE_BELOW = 0.05
     MSN_ISOTOPIC_PATTERN_WIDTH = 0.80
     MSN_IGNORE_BELOW = 0.05
+
+    MS1_SCORE_THRESHOLD = 20.0
+    MSN_SCORE_THRESHOLD = 10.0
 
     def __init__(self, ms_file, averagine=n_glycan_averagine, charge_range=(-1, -8),
                  ms1_peak_picking_args=None, msn_peak_picking_args=None, ms1_deconvolution_args=None,
@@ -155,6 +166,7 @@ class CentroidingSampleConsumer(SampleConsumer):
 
 
 class GlycanChromatogramAnalyzer(TaskBase):
+
     @staticmethod
     def expand_adducts(adduct_counts):
         counts = descending_combination_counter(adduct_counts)
@@ -174,22 +186,31 @@ class GlycanChromatogramAnalyzer(TaskBase):
 
     def __init__(self, database_connection, hypothesis_id, sample_run_id, adducts=None,
                  mass_error_tolerance=1e-5, grouping_error_tolerance=1.5e-5,
-                 scoring_model=GeneralScorer, network_sharing=0.2, minimum_mass=500.,
-                 analysis_name=None, delta_rt=0.25):
+                 scoring_model=GeneralScorer, minimum_mass=500., regularize=None,
+                 regularization_model=None, analysis_name=None, delta_rt=0.5,
+                 require_msms_signature=0):
         self.database_connection = database_connection
         self.hypothesis_id = hypothesis_id
         self.sample_run_id = sample_run_id
+
         self.mass_error_tolerance = mass_error_tolerance
         self.grouping_error_tolerance = grouping_error_tolerance
-        self.minimum_mass = minimum_mass
+
         self.scoring_model = scoring_model
-        self.network_sharing = network_sharing
+        self.regularize = regularize
+
+        self.regularization_model = regularization_model
+
+        self.minimum_mass = minimum_mass
+        self.delta_rt = delta_rt
         self.adducts = adducts
+
+        self.require_msms_signature = require_msms_signature
+
         self.analysis_name = analysis_name
         self.analysis = None
-        self.delta_rt = delta_rt
 
-    def save_solutions(self, solutions, extractor, database):
+    def save_solutions(self, solutions, extractor, database, evaluator):
         if self.analysis_name is None:
             return
         self.log('Saving solutions')
@@ -198,15 +219,19 @@ class GlycanChromatogramAnalyzer(TaskBase):
         analysis_saver.set_peak_lookup_table(extractor.peak_mapping)
         analysis_saver.set_analysis_type(AnalysisTypeEnum.glycan_lc_ms.name)
 
-        analysis_saver.set_parameters({
+        param_dict = {
             "hypothesis_id": self.hypothesis_id,
             "sample_run_id": self.sample_run_id,
             "mass_error_tolerance": self.mass_error_tolerance,
             "grouping_error_tolerance": self.grouping_error_tolerance,
-            "network_sharing": self.network_sharing,
             "adducts": [adduct.name for adduct in self.adducts],
             "minimum_mass": self.minimum_mass,
-        })
+            "require_msms_signature": self.require_msms_signature,
+        }
+
+        evaluator.update_parameters(param_dict)
+
+        analysis_saver.set_parameters(param_dict)
 
         n = len(solutions)
         i = 0
@@ -227,6 +252,11 @@ class GlycanChromatogramAnalyzer(TaskBase):
             self.database_connection, sample_run_id=self.sample_run_id)
         return peak_loader
 
+    def load_msms(self, peak_loader):
+        prec_info = peak_loader.precursor_information()
+        msms_scans = [o.product for o in prec_info]
+        return msms_scans
+
     def make_database(self):
         database = GlycanCompositionDiskBackedStructureDatabase(
             self.database_connection, self.hypothesis_id)
@@ -239,41 +269,110 @@ class GlycanChromatogramAnalyzer(TaskBase):
         return extractor
 
     def make_chromatogram_processor(self, extractor, database):
-        proc = ChromatogramProcessor(
-            extractor, database, mass_error_tolerance=self.mass_error_tolerance,
-            adducts=self.adducts, scoring_model=self.scoring_model,
-            network_sharing=self.network_sharing, delta_rt=self.delta_rt)
+        if self.regularize is not None or self.regularization_model is not None:
+            proc = LaplacianRegularizedChromatogramProcessor(
+                extractor, database, mass_error_tolerance=self.mass_error_tolerance,
+                adducts=self.adducts, scoring_model=self.scoring_model,
+                delta_rt=self.delta_rt, smoothing_factor=self.regularize,
+                regularization_model=self.regularization_model)
+        else:
+            proc = LogitSumChromatogramProcessor(
+                extractor, database, mass_error_tolerance=self.mass_error_tolerance,
+                adducts=self.adducts, scoring_model=self.scoring_model,
+                delta_rt=self.delta_rt)
         return proc
+
+    def make_mapper(self, chromatograms, peak_loader, msms_scans=None, default_glycan_composition=None,
+                    scorer_type=SignatureIonScorer):
+        mapper = SignatureIonMapper(
+            msms_scans, chromatograms, peak_loader.convert_scan_id_to_retention_time,
+            self.adducts, self.minimum_mass, chunk_size=1000,
+            default_glycan_composition=default_glycan_composition,
+            scorer_type=scorer_type)
+        return mapper
+
+    def annotate_matches_with_msms(self, chromatograms, peak_loader, msms_scans, database):
+        default_glycan_composition = glypy.GlycanComposition(
+            database.hypothesis.monosaccharide_bounds())
+        mapper = self.make_mapper(
+            chromatograms, peak_loader, msms_scans, default_glycan_composition)
+        self.log("Mapping MS/MS")
+        mapped_matches = mapper.map_to_chromatograms(self.mass_error_tolerance)
+        self.log("Evaluating MS/MS")
+        annotate_matches = mapper.score_mapped_tandem(
+            mapped_matches, error_tolerance=self.mass_error_tolerance)
+        return annotate_matches
+
+    def process_chromatograms(self, processor, peak_loader, database):
+        if self.require_msms_signature > 0:
+            self.log("Extracting MS/MS")
+            msms_scans = self.load_msms(peak_loader)
+            if len(msms_scans) == 0:
+                self.log("No MS/MS scans present. Ignoring requirement.")
+                processor.run()
+            else:
+                matches = processor.match_compositions()
+                annotated_matches = self.annotate_matches_with_msms(
+                    matches, peak_loader, msms_scans, database)
+                kept_annotated_matches = []
+                for match in annotated_matches:
+                    accepted = False
+                    for gsm in match.tandem_solutions:
+                        if gsm.score > self.require_msms_signature:
+                            accepted = True
+                            break
+                    if accepted:
+                        kept_annotated_matches.append(match)
+                kept_annotated_matches = ChromatogramFilter(kept_annotated_matches)
+                processor.evaluate_chromatograms(kept_annotated_matches)
+        else:
+            processor.run()
 
     def run(self):
         peak_loader = self.make_peak_loader()
         database = self.make_database()
         extractor = self.make_chromatogram_extractor(peak_loader)
         proc = self.make_chromatogram_processor(extractor, database)
-        proc.run()
-        self.save_solutions(proc.solutions, extractor, database)
+        self.processor = proc
+        self.process_chromatograms(proc, peak_loader, database)
+        self.save_solutions(proc.solutions, extractor, database, proc.evaluator)
         return proc
 
 
 class MzMLGlycanChromatogramAnalyzer(GlycanChromatogramAnalyzer):
     def __init__(self, database_connection, hypothesis_id, sample_path, output_path,
                  adducts=None, mass_error_tolerance=1e-5, grouping_error_tolerance=1.5e-5,
-                 scoring_model=None, network_sharing=0.2, minimum_mass=500.,
-                 analysis_name=None, delta_rt=0.25):
+                 scoring_model=None, minimum_mass=500., regularize=None,
+                 regularization_model=None, analysis_name=None, delta_rt=0.5,
+                 require_msms_signature=0):
         super(MzMLGlycanChromatogramAnalyzer, self).__init__(
             database_connection, hypothesis_id, -1, adducts,
             mass_error_tolerance, grouping_error_tolerance,
-            scoring_model, network_sharing, minimum_mass,
-            analysis_name, delta_rt)
+            scoring_model, minimum_mass, regularize, regularization_model,
+            analysis_name, delta_rt, require_msms_signature)
         self.sample_path = sample_path
         self.output_path = output_path
 
     def make_peak_loader(self):
         peak_loader = ProcessedMzMLDeserializer(self.sample_path)
+        if peak_loader.extended_index is None:
+            if not peak_loader.has_index_file():
+                self.log("Index file missing. Rebuilding.")
+                peak_loader.build_extended_index()
+            else:
+                peak_loader.read_index_file()
+            if peak_loader.extended_index is None or len(peak_loader.extended_index.ms1_ids) < 1:
+                raise ValueError("Sample Data Invalid: Could not validate MS Index")
+
         return peak_loader
 
-    def save_solutions(self, solutions, extractor, database):
-        if self.analysis_name is None:
+    def load_msms(self, peak_loader):
+        prec_info = peak_loader.precursor_information()
+        msms_scans = [ScanStub(o, peak_loader) for o in prec_info]
+        return msms_scans
+
+    def save_solutions(self, solutions, extractor, database, evaluator):
+        if self.analysis_name is None or self.output_path is None:
             return
         self.log('Saving solutions')
 
@@ -281,18 +380,21 @@ class MzMLGlycanChromatogramAnalyzer(GlycanChromatogramAnalyzer):
             self.output_path, self.analysis_name, extractor.peak_loader.sample_run,
             solutions, database, extractor)
 
-        exporter.run()
-        exporter.set_parameters({
+        param_dict = {
             "hypothesis_id": self.hypothesis_id,
             "sample_run_id": self.sample_path,
             "sample_path": self.sample_path,
             "sample_name": extractor.peak_loader.sample_run.name,
             "mass_error_tolerance": self.mass_error_tolerance,
             "grouping_error_tolerance": self.grouping_error_tolerance,
-            "network_sharing": self.network_sharing,
             "adducts": [adduct.name for adduct in self.adducts],
             "minimum_mass": self.minimum_mass,
-        })
+        }
+
+        evaluator.update_parameters(param_dict)
+
+        exporter.run()
+        exporter.set_parameters(param_dict)
         self.analysis = exporter.analysis
 
 
@@ -301,7 +403,8 @@ class GlycopeptideLCMSMSAnalyzer(TaskBase):
                  analysis_name=None, grouping_error_tolerance=1.5e-5, mass_error_tolerance=1e-5,
                  msn_mass_error_tolerance=2e-5, psm_fdr_threshold=0.05, peak_shape_scoring_model=None,
                  tandem_scoring_model=None, minimum_mass=1000., save_unidentified=False,
-                 oxonium_threshold=0.05, scan_transformer=None, n_processes=5):
+                 oxonium_threshold=0.05, scan_transformer=None, n_processes=5,
+                 spectra_chunk_size=1000):
         if tandem_scoring_model is None:
             tandem_scoring_model = CoverageWeightedBinomialScorer
         if peak_shape_scoring_model is None:
@@ -327,6 +430,7 @@ class GlycopeptideLCMSMSAnalyzer(TaskBase):
         self.minimum_oxonium_ratio = oxonium_threshold
         self.scan_transformer = scan_transformer
         self.n_processes = n_processes
+        self.spectra_chunk_size = spectra_chunk_size
 
     def make_peak_loader(self):
         peak_loader = DatabaseScanDeserializer(
@@ -361,7 +465,8 @@ class GlycopeptideLCMSMSAnalyzer(TaskBase):
     def do_search(self, searcher):
         target_hits, decoy_hits = searcher.search(
             precursor_error_tolerance=self.mass_error_tolerance,
-            error_tolerance=self.msn_mass_error_tolerance)
+            error_tolerance=self.msn_mass_error_tolerance,
+            chunk_size=self.spectra_chunk_size)
         return target_hits, decoy_hits
 
     def estimate_fdr(self, searcher, target_hits, decoy_hits):
@@ -474,42 +579,12 @@ class GlycopeptideLCMSMSAnalyzer(TaskBase):
         self.analysis_id = analysis_saver.analysis_id
 
 
-class ScanStub(object):
-    """A stub for holding precursor information and
-    giving a Scan-like interface for accessing just that
-    information. Provides a serialized-like interface
-    which clients can use to load the real scan.
-
-    Attributes
-    ----------
-    id : str
-        The scan ID for the proxied scan
-    precursor_information : PrecursorInformation
-        The information describing the relevant
-        metadata for scheduling when and where this
-        scan should be processed, where actual loading
-        will occur.
-    bind : MzMLLoader
-        A resource to use to load scans with by scan id.
-    """
-    def __init__(self, precursor_information, bind):
-        self.id = precursor_information.product_scan_id
-        self.precursor_information = precursor_information
-        self.bind = bind
-
-    def convert(self, *args, **kwargs):
-        try:
-            return self.bind.get_scan_by_id(self.id)
-        except AttributeError:
-            raise KeyError(self.id)
-
-
 class MzMLGlycopeptideLCMSMSAnalyzer(GlycopeptideLCMSMSAnalyzer):
     def __init__(self, database_connection, hypothesis_id, sample_path, output_path,
                  analysis_name=None, grouping_error_tolerance=1.5e-5, mass_error_tolerance=1e-5,
                  msn_mass_error_tolerance=2e-5, psm_fdr_threshold=0.05, peak_shape_scoring_model=None,
                  tandem_scoring_model=None, minimum_mass=1000., save_unidentified=False,
-                 oxonium_threshold=0.05, scan_transformer=None, n_processes=5):
+                 oxonium_threshold=0.05, scan_transformer=None, n_processes=5, spectra_chunk_size=1000):
         super(MzMLGlycopeptideLCMSMSAnalyzer, self).__init__(
             database_connection,
             hypothesis_id, -1,
@@ -519,12 +594,20 @@ class MzMLGlycopeptideLCMSMSAnalyzer(GlycopeptideLCMSMSAnalyzer):
             tandem_scoring_model, minimum_mass,
             save_unidentified, oxonium_threshold,
             scan_transformer,
-            n_processes)
+            n_processes, spectra_chunk_size)
         self.sample_path = sample_path
         self.output_path = output_path
 
     def make_peak_loader(self):
         peak_loader = ProcessedMzMLDeserializer(self.sample_path)
+        if peak_loader.extended_index is None:
+            if not peak_loader.has_index_file():
+                self.log("Index file missing. Rebuilding.")
+                peak_loader.build_extended_index()
+            else:
+                peak_loader.read_index_file()
+            if peak_loader.extended_index is None or len(peak_loader.extended_index.msn_ids) < 1:
+                raise ValueError("Sample Data Invalid: Could not validate MS/MS Index")
         return peak_loader
 
     def load_msms(self, peak_loader):

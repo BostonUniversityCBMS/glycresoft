@@ -17,11 +17,15 @@ from .ref import TargetReference, SpectrumReference
 
 class _mass_wrapper(object):
 
-    def __init__(self, mass):
+    def __init__(self, mass, annotation=None):
         self.value = mass
+        self.annotation = annotation if annotation is not None else mass
 
     def mass(self, *args, **kwargs):
         return self.value
+
+    def __repr__(self):
+        return "MassWrapper(%f, %s)" % (self.value, self.annotation)
 
 
 _hexnac = FrozenMonosaccharideResidue.from_iupac_lite("HexNAc")
@@ -109,7 +113,59 @@ def group_by_precursor_mass(scans, window_size=1.5e-5):
     return groups
 
 
-class SpectrumMatchBase(object):
+class ScanStub(object):
+    """A stub for holding precursor information and
+    giving a Scan-like interface for accessing just that
+    information. Provides a serialized-like interface
+    which clients can use to load the real scan.
+
+    Attributes
+    ----------
+    id : str
+        The scan ID for the proxied scan
+    precursor_information : PrecursorInformation
+        The information describing the relevant
+        metadata for scheduling when and where this
+        scan should be processed, where actual loading
+        will occur.
+    bind : MzMLLoader
+        A resource to use to load scans with by scan id.
+    """
+    def __init__(self, precursor_information, bind):
+        self.id = precursor_information.product_scan_id
+        self.precursor_information = precursor_information
+        self.bind = bind
+
+    def convert(self, *args, **kwargs):
+        try:
+            return self.bind.get_scan_by_id(self.id)
+        except AttributeError:
+            raise KeyError(self.id)
+
+
+class ScanWrapperBase(object):
+    @property
+    def precursor_ion_mass(self):
+        self.requires_scan()
+        neutral_mass = self.scan.precursor_information.extracted_neutral_mass
+        return neutral_mass
+
+    @property
+    def scan_time(self):
+        self.requires_scan()
+        return self.scan.scan_time
+
+    @property
+    def precursor_information(self):
+        self.requires_scan()
+        return self.scan.precursor_information
+
+    def requires_scan(self):
+        if self.scan is None:
+            raise ValueError("%s is detatched from Scan" % (self.__class__.__name__))
+
+
+class SpectrumMatchBase(ScanWrapperBase):
     __slots__ = ['scan', 'target']
 
     def __init__(self, scan, target):
@@ -125,17 +181,16 @@ class SpectrumMatchBase(object):
         deconvoluted_peak_set._reindex()
         return deconvoluted_peak_set
 
-    def precursor_ion_mass(self):
-        neutral_mass = self.scan.precursor_information.extracted_neutral_mass
-        return neutral_mass
-
     def precursor_mass_accuracy(self):
-        observed = self.precursor_ion_mass()
+        observed = self.precursor_ion_mass
         theoretical = self.target.total_composition().mass
         return (observed - theoretical) / theoretical
 
     def __reduce__(self):
         return self.__class__, (self.scan, self.target)
+
+    def get_top_solutions(self):
+        return [self]
 
     def __eq__(self, other):
         try:
@@ -203,6 +258,12 @@ class SpectrumMatcherBase(SpectrumMatchBase):
         return "{self.__class__.__name__}({self.spectrum}, {self.target}, {self.score})".format(
             self=self)
 
+    def plot(self, ax=None, **kwargs):
+        from glycan_profiling.plotting import spectral_annotation
+        art = spectral_annotation.SpectrumMatchAnnotator(self, ax=ax)
+        art.draw(**kwargs)
+        return art
+
 
 class DeconvolutingSpectrumMatcherBase(SpectrumMatcherBase):
 
@@ -259,7 +320,7 @@ class SpectrumMatch(SpectrumMatchBase):
         return cls(match.scan, match.target, match.score)
 
 
-class SpectrumSolutionSet(object):
+class SpectrumSolutionSet(ScanWrapperBase):
 
     def __init__(self, scan, solutions):
         self.scan = scan
@@ -286,10 +347,6 @@ class SpectrumSolutionSet(object):
         if self._target_map is None:
             self._make_target_map()
         return self._target_map[target]
-
-    def precursor_ion_mass(self):
-        neutral_mass = self.scan.precursor_information.extracted_neutral_mass
-        return neutral_mass
 
     def precursor_mass_accuracy(self):
         return self.best_solution().precursor_mass_accuracy()
@@ -456,7 +513,11 @@ class TandemClusterEvaluatorBase(TaskBase):
 
     def _evaluate_hit_groups_single_process(self, scan_map, hit_map, hit_to_scan, *args, **kwargs):
         scan_solution_map = defaultdict(list)
-        self.log("... Searching Hits (%d)" % (len(hit_to_scan),))
+        self.log("... Searching Hits (%d:%d)" % (
+            len(hit_to_scan),
+            sum(map(len, hit_to_scan.values()))
+            )
+        )
         i = 0
         n = len(hit_to_scan)
         for hit_id, scan_list in hit_to_scan.items():

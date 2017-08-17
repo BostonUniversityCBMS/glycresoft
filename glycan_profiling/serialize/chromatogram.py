@@ -1,6 +1,10 @@
+from collections import Counter
+
+import numpy as np
+
 from sqlalchemy import (
     Column, Numeric, Integer, String, ForeignKey, PickleType,
-    Boolean, Table, func, select, join)
+    Boolean, Table, func, select, join, alias)
 from sqlalchemy.orm import relationship, backref, object_session
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.orm.collections import attribute_mapped_collection
@@ -12,7 +16,10 @@ from glycan_profiling.chromatogram_tree import (
     Chromatogram as MemoryChromatogram,
     MassShift as MemoryMassShift,
     CompoundMassShift as MemoryCompoundMassShift,
-    GlycanCompositionChromatogram as MemoryGlycanCompositionChromatogram)
+    GlycanCompositionChromatogram as MemoryGlycanCompositionChromatogram,
+    ChromatogramInterface)
+
+from glycan_profiling.chromatogram_tree.chromatogram import MIN_POINTS_FOR_CHARGE_STATE
 
 from glycan_profiling.scoring import (
     ChromatogramSolution as MemoryChromatogramSolution)
@@ -168,6 +175,13 @@ class ChromatogramTreeNode(Base, BoundToAnalysis):
 
     members = relationship(DeconvolutedPeak, secondary=lambda: ChromatogramTreeNodeToDeconvolutedPeak, lazy="subquery")
 
+    def charge_states(self):
+        u = set()
+        u.update({p.charge for p in self.members})
+        for child in self.children:
+            u.update(child.charge_states())
+        return u
+
     @classmethod
     def _convert(cls, session, id, node_type_cache=None, scan_id_cache=None):
         if node_type_cache is None:
@@ -204,7 +218,7 @@ class ChromatogramTreeNode(Base, BoundToAnalysis):
 
         children_ids = session.query(ChromatogramTreeNodeBranch.child_id).filter(
             ChromatogramTreeNodeBranch.parent_id == id)
-        children = [cls._convert(i, node_type_cache) for i in children_ids]
+        children = [cls._convert(session, i[0], node_type_cache) for i in children_ids]
 
         return MemoryChromatogramTreeNode(
             attribs.retention_time, scan_id, children, members,
@@ -269,6 +283,9 @@ class ChromatogramTreeNode(Base, BoundToAnalysis):
         session.flush()
         return inst
 
+    def _total_intensity_query(self, session):
+        session.query()
+
 
 class ChromatogramTreeNodeBranch(Base):
     __tablename__ = "ChromatogramTreeNodeBranch"
@@ -308,8 +325,72 @@ class Chromatogram(Base, BoundToAnalysis):
 
     nodes = relationship(ChromatogramTreeNode, secondary=lambda: ChromatogramToChromatogramTreeNode)
 
+    @property
+    def adducts(self):
+        session = object_session(self)
+        return self._adducts_query(session)
+
+    def _adducts_query(self, session):
+        anode = alias(ChromatogramTreeNode.__table__)
+        bnode = alias(ChromatogramTreeNode.__table__)
+        apeak = alias(DeconvolutedPeak.__table__)
+
+        peak_join = apeak.join(
+            ChromatogramTreeNodeToDeconvolutedPeak,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.peak_id == apeak.c.id)
+
+        root_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == anode.c.id)
+
+        branch_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramTreeNodeBranch,
+            ChromatogramTreeNodeBranch.child_id == anode.c.id).join(
+            bnode, ChromatogramTreeNodeBranch.parent_id == bnode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == bnode.c.id)
+
+        branch_node_info = select([anode.c.node_type_id, anode.c.retention_time]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(branch_peaks_join)
+
+        root_node_info = select([anode.c.node_type_id, anode.c.retention_time]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(root_peaks_join)
+
+        all_node_info_q = root_node_info.union_all(branch_node_info).order_by(
+            anode.c.retention_time)
+
+        all_node_info = session.execute(all_node_info_q).fetchall()
+
+        node_type_ids = set()
+        for node_type_id, rt in all_node_info:
+            node_type_ids.add(node_type_id)
+
+        node_types = []
+        for ntid in node_type_ids:
+            node_types.append(session.query(CompoundMassShift).get(ntid).convert())
+        return node_types
+
     def get_chromatogram(self):
-        return self.convert()
+        # return self.convert()
+        return self
+
+    @property
+    def charge_states(self):
+        states = Counter()
+        for node in self.nodes:
+            states += (Counter(node.charge_states()))
+        # Require more than `MIN_POINTS_FOR_CHARGE_STATE` data points to accept any
+        # charge state
+        collapsed_states = {k for k, v in states.items() if v >= min(MIN_POINTS_FOR_CHARGE_STATE, len(self))}
+        if not collapsed_states:
+            collapsed_states = set(states.keys())
+        return collapsed_states
 
     def raw_convert(self, node_type_cache=None, scan_id_cache=None):
         session = object_session(self)
@@ -354,20 +435,181 @@ class Chromatogram(Base, BoundToAnalysis):
             {"chromatogram_id": inst.id, "node_id": node_id} for node_id in node_ids])
         return inst
 
-    def _total_signal_query(self, session):
-        return session.query(
-            Chromatogram.id,
-            func.sum(DeconvolutedPeak.intensity)).join(
-            Chromatogram.nodes).join(ChromatogramTreeNode.members).group_by(
-            Chromatogram.id).filter(Chromatogram.id == self.id)
+    def _weighted_neutral_mass_query(self, session):
+        anode = alias(ChromatogramTreeNode.__table__)
+        bnode = alias(ChromatogramTreeNode.__table__)
+        apeak = alias(DeconvolutedPeak.__table__)
+
+        peak_join = apeak.join(
+            ChromatogramTreeNodeToDeconvolutedPeak,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.peak_id == apeak.c.id)
+
+        root_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == anode.c.id)
+
+        branch_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramTreeNodeBranch,
+            ChromatogramTreeNodeBranch.child_id == anode.c.id).join(
+            bnode, ChromatogramTreeNodeBranch.parent_id == bnode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == bnode.c.id)
+
+        branch_intensities = select([apeak.c.intensity, apeak.c.neutral_mass]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(branch_peaks_join)
+
+        root_intensities = select([apeak.c.intensity, apeak.c.neutral_mass]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(root_peaks_join)
+
+        all_intensity_mass_q = root_intensities.union_all(branch_intensities)
+
+        all_intensity_mass = session.execute(all_intensity_mass_q).fetchall()
+
+        arr = np.array(all_intensity_mass)
+        intensity = arr[:, 0]
+        mass = arr[:, 1]
+        return mass.dot(intensity) / intensity.sum()
+
+    def _as_array_query(self, session):
+        anode = alias(ChromatogramTreeNode.__table__)
+        bnode = alias(ChromatogramTreeNode.__table__)
+        apeak = alias(DeconvolutedPeak.__table__)
+
+        peak_join = apeak.join(
+            ChromatogramTreeNodeToDeconvolutedPeak,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.peak_id == apeak.c.id)
+
+        root_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == anode.c.id)
+
+        branch_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramTreeNodeBranch,
+            ChromatogramTreeNodeBranch.child_id == anode.c.id).join(
+            bnode, ChromatogramTreeNodeBranch.parent_id == bnode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == bnode.c.id)
+
+        branch_intensities = select([apeak.c.intensity, anode.c.retention_time]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(branch_peaks_join)
+
+        root_intensities = select([apeak.c.intensity, anode.c.retention_time]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(root_peaks_join)
+
+        all_intensities_q = root_intensities.union_all(branch_intensities).order_by(
+            anode.c.retention_time)
+
+        all_intensities = session.execute(all_intensities_q).fetchall()
+
+        time = []
+        signal = []
+        current_signal = all_intensities[0][0]
+        current_time = all_intensities[0][1]
+
+        for intensity, rt in all_intensities[1:]:
+            if abs(current_time - rt) < 1e-4:
+                current_signal += intensity
+            else:
+                time.append(current_time)
+                signal.append(current_signal)
+                current_time = rt
+                current_signal = intensity
+        time.append(current_time)
+        signal.append(current_signal)
+        return np.array(time), np.array(signal)
+
+    def as_arrays(self):
+        session = object_session(self)
+        return self._as_array_query(session)
+
+    @property
+    def weighted_neutral_mass(self):
+        session = object_session(self)
+        return self._weighted_neutral_mass_query(session)
 
     @property
     def total_signal(self):
         session = object_session(self)
-        return self._total_signal_query(session).first()[1]
+        return self._as_array_query(session)[1].sum()
+
+    @property
+    def apex_time(self):
+        time, intensity = self.as_arrays()
+        return time[np.argmax(intensity)]
 
     def __repr__(self):
         return "DB" + repr(self.convert())
+
+    def __len__(self):
+        return len(self.nodes)
+
+    def __getitem__(self, i):
+        return self.nodes[i]
+
+    def __iter__(self):
+        return iter(self.nodes)
+
+
+ChromatogramInterface.register(Chromatogram)
+
+
+class ChromatogramWrapper(object):
+
+    def _get_chromatogram(self):
+        return self.chromatogram
+
+    @property
+    def adducts(self):
+        return self._get_chromatogram().adducts
+
+    @property
+    def weighted_neutral_mass(self):
+        return self._get_chromatogram().weighted_neutral_mass
+
+    @property
+    def total_signal(self):
+        return self._get_chromatogram().total_signal
+
+    def __len__(self):
+        return len(self._get_chromatogram())
+
+    def as_arrays(self):
+        return self._get_chromatogram().as_arrays()
+
+    @property
+    def start_time(self):
+        return self._get_chromatogram().start_time
+
+    @property
+    def end_time(self):
+        return self._get_chromatogram().end_time
+
+    @property
+    def apex_time(self):
+        return self._get_chromatogram().apex_time
+
+    @property
+    def neutral_mass(self):
+        return self._get_chromatogram().neutral_mass
+
+    @property
+    def charge_states(self):
+        return self._get_chromatogram().charge_states
+
+
+ChromatogramInterface.register(ChromatogramWrapper)
 
 
 ChromatogramToChromatogramTreeNode = Table(
@@ -416,7 +658,7 @@ class ScoredChromatogram(object):
     internal_score = Column(Numeric(8, 7, asdecimal=False))
 
 
-class ChromatogramSolution(Base, BoundToAnalysis, ScoredChromatogram):
+class ChromatogramSolution(Base, BoundToAnalysis, ScoredChromatogram, ChromatogramWrapper):
     __tablename__ = "ChromatogramSolution"
 
     id = Column(Integer, primary_key=True)
@@ -430,7 +672,8 @@ class ChromatogramSolution(Base, BoundToAnalysis, ScoredChromatogram):
     composition_group = relationship(CompositionGroup)
 
     def get_chromatogram(self):
-        return self.chromatogram.convert()
+        # return self.chromatogram.convert()
+        return self.chromatogram.get_chromatogram()
 
     @property
     def key(self):
@@ -439,27 +682,30 @@ class ChromatogramSolution(Base, BoundToAnalysis, ScoredChromatogram):
         else:
             return self.neutral_mass
 
-    @property
-    def neutral_mass(self):
-        return self.chromatogram.neutral_mass
+    # @property
+    # def neutral_mass(self):
+    #     return self.chromatogram.neutral_mass
 
-    @property
-    def start_time(self):
-        return self.chromatogram.start_time
+    # @property
+    # def start_time(self):
+    #     return self.chromatogram.start_time
 
-    @property
-    def end_time(self):
-        return self.chromatogram.end_time
+    # @property
+    # def end_time(self):
+    #     return self.chromatogram.end_time
 
     @property
     def composition(self):
         return self.composition_group
 
     def convert(self, *args, **kwargs):
+        chromatogram_scoring_model = kwargs.pop(
+            "chromatogram_scoring_model", GeneralScorer)
         chromatogram = self.chromatogram.convert(*args, **kwargs)
         composition = self.composition_group.convert() if self.composition_group else None
         chromatogram.composition = composition
-        sol = MemoryChromatogramSolution(chromatogram, self.score, GeneralScorer, self.internal_score)
+        sol = MemoryChromatogramSolution(
+            chromatogram, self.score, chromatogram_scoring_model, self.internal_score)
         used_as_adduct = []
         for pair in self.used_as_adduct:
             used_as_adduct.append((pair[0], pair[1].convert()))
@@ -509,15 +755,35 @@ class ChromatogramSolution(Base, BoundToAnalysis, ScoredChromatogram):
         session.flush()
         return inst
 
-    @property
-    def total_signal(self):
-        return self.chromatogram.total_signal
+    # @property
+    # def total_signal(self):
+    #     return self.chromatogram.total_signal
+
+    # @property
+    # def weighted_neutral_mass(self):
+    #     return self.chromatogram.weighted_neutral_mass
 
     def __repr__(self):
         return "DB" + repr(self.convert())
 
+    # def __len__(self):
+    #     return len(self.chromatogram)
 
-class GlycanCompositionChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
+
+class ChromatogramSolutionWrapper(ChromatogramWrapper):
+    def _get_chromatogram(self):
+        return self.solution
+
+    @property
+    def used_as_adduct(self):
+        return self._get_chromatogram().used_as_adduct
+
+    @property
+    def ambiguous_with(self):
+        return self._get_chromatogram().ambiguous_with
+
+
+class GlycanCompositionChromatogram(Base, BoundToAnalysis, ScoredChromatogram, ChromatogramSolutionWrapper):
     __tablename__ = "GlycanCompositionChromatogram"
 
     id = Column(Integer, primary_key=True)
@@ -532,21 +798,9 @@ class GlycanCompositionChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
 
     entity = relationship(GlycanComposition)
 
-    @property
-    def used_as_adduct(self):
-        return self.solution.used_as_adduct
-
-    @property
-    def ambiguous_with(self):
-        return self.solution.ambiguous_with
-
-    @property
-    def total_signal(self):
-        return self.solution.total_signal
-
-    def convert(self):
+    def convert(self, *args, **kwargs):
         entity = self.entity.convert()
-        solution = self.solution.convert()
+        solution = self.solution.convert(*args, **kwargs)
         case = solution.chromatogram.clone(MemoryGlycanCompositionChromatogram)
         case.composition = entity
         solution.chromatogram = case
@@ -572,13 +826,17 @@ class GlycanCompositionChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
 
     @property
     def glycan_composition(self):
-        return self.entity
+        return self.entity.convert()
+
+    @property
+    def composition(self):
+        return self.glycan_composition
 
     def __repr__(self):
         return "DB" + repr(self.convert())
 
 
-class UnidentifiedChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
+class UnidentifiedChromatogram(Base, BoundToAnalysis, ScoredChromatogram, ChromatogramSolutionWrapper):
     __tablename__ = "UnidentifiedChromatogram"
 
     id = Column(Integer, primary_key=True)
@@ -588,20 +846,8 @@ class UnidentifiedChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
 
     solution = relationship(ChromatogramSolution)
 
-    @property
-    def used_as_adduct(self):
-        return self.solution.used_as_adduct
-
-    @property
-    def ambiguous_with(self):
-        return self.solution.ambiguous_with
-
-    @property
-    def total_signal(self):
-        return self.solution.total_signal
-
-    def convert(self):
-        solution = self.solution.convert()
+    def convert(self, *args, **kwargs):
+        solution = self.solution.convert(*args, **kwargs)
         solution.id = self.id
         solution.solution_id = self.solution.id
         return solution
@@ -626,6 +872,10 @@ class UnidentifiedChromatogram(Base, BoundToAnalysis, ScoredChromatogram):
 
     @property
     def glycan_composition(self):
+        return None
+
+    @property
+    def composition(self):
         return None
 
 

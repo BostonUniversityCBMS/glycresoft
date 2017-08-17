@@ -61,8 +61,10 @@ class ImportableGlycanHypothesisCSVSerializer(CSVSerializerBase):
     def convert_object(self, obj):
         attribs = [
             obj.composition,
-            "\t".join([sc.name for sc in obj.structure_classes])
-        ]
+        # Use list concatenation to ensure that the glycan classes
+        # are treated as independent entries not containing whitespace
+        # so that they are not quoted
+        ] + [sc.name for sc in obj.structure_classes]
         return map(str, attribs)
 
 
@@ -214,7 +216,7 @@ class GlycopeptideSpectrumMatchAnalysisCSVSerializer(CSVSerializerBase):
             precursor_mass,
             ((obj.target.total_mass - precursor_mass
               ) / precursor_mass),
-            obj.scan.id,
+            obj.scan.scan_id,
             obj.scan.precursor_information.extracted_charge,
             obj.score,
             obj.q_value,

@@ -15,7 +15,10 @@ from .chromatogram_tree import (
 from .scan_cache import NullScanCacheHandler
 
 from .scoring import (
-    ChromatogramSolution, NetworkScoreDistributor, ChromatogramScorer)
+    ChromatogramSolution,
+    ChromatogramScorer)
+
+from .composition_distribution_model import smooth_network, display_table
 
 
 class ScanSink(object):
@@ -89,74 +92,6 @@ def span_overlap(self, interval):
     return cond
 
 
-def join_mass_shifted(chromatograms, adducts, mass_error_tolerance=1e-5):
-    out = []
-    for chroma in chromatograms:
-        add = chroma
-        for adduct in adducts:
-            match = chromatograms.find_mass(chroma.neutral_mass + adduct.mass, mass_error_tolerance)
-            if match and span_overlap(add, match):
-                try:
-                    match.used_as_adduct.append((add.key, adduct))
-                    add = add.merge(match, node_type=adduct)
-                    add.created_at = "join_mass_shifted"
-                    add.adducts.append(adduct)
-                except DuplicateNodeError as e:
-                    e.original = chroma
-                    e.to_add = match
-                    e.accumulated = add
-                    e.adduct = adduct
-                    raise e
-        out.append(add)
-    return ChromatogramFilter(out)
-
-
-def reverse_adduction_search(chromatograms, adducts, mass_error_tolerance, database, chromatogram_type=None):
-    if chromatogram_type is None:
-        chromatogram_type = GlycanCompositionChromatogram
-    exclude_compositions = dict()
-    candidate_chromatograms = []
-
-    new_members = {}
-    unmatched = []
-
-    for chroma in chromatograms:
-        if chroma.composition is not None:
-            exclude_compositions[chroma.composition] = chroma
-        else:
-            candidate_chromatograms.append(chroma)
-
-    for chroma in candidate_chromatograms:
-        candidate_mass = chroma.neutral_mass
-        matched = False
-        exclude = False
-        for adduct in adducts:
-            matches = database.search_mass_ppm(
-                candidate_mass - adduct.mass, mass_error_tolerance)
-            for match in matches:
-                name = str(match)
-                if name in exclude_compositions:
-                    exclude = True
-                    continue
-                if name in new_members:
-                    chroma_to_update = new_members[name]
-                else:
-                    chroma_to_update = chromatogram_type(match)
-                    chroma_to_update.created_at = "reverse_adduction_search"
-                chroma, _ = chroma.bisect_adduct(Unmodified)
-                chroma_to_update = chroma_to_update.merge(chroma, adduct)
-                chroma_to_update.created_at = "reverse_adduction_search"
-                new_members[name] = chroma_to_update
-                matched = True
-        if not matched and not exclude:
-            unmatched.append(chroma)
-    out = []
-    out.extend(exclude_compositions.values())
-    out.extend(new_members.values())
-    out.extend(unmatched)
-    return ChromatogramFilter(out)
-
-
 def prune_bad_adduct_branches(solutions, score_margin=0.05, ratio_threshold=1.5):
     solutions._build_key_map()
     key_map = solutions._key_map
@@ -178,8 +113,7 @@ def prune_bad_adduct_branches(solutions, score_margin=0.05, ratio_threshold=1.5)
                     complement_signal = owner_item.total_signal - component_signal
                     signal_ratio = complement_signal / component_signal
 
-                    # The owner is more than half-again as abundant as the
-                    # used-as-adduct-case
+                    # The owner is more abundant than used-as-adduct-case
                     if signal_ratio > ratio_threshold:
                         is_weaker = False
                 if is_weaker:
@@ -280,20 +214,38 @@ class ChromatogramMatcher(TaskBase):
                 if matches is None:
                     continue
                 for match in matches:
-                    name = (match)
+                    name = match
                     if name in exclude_compositions:
-                        exclude = True
-                        continue
-                    if name in new_members:
-                        chroma_to_update = new_members[name]
+                        # This chromatogram matches another form of an existing composition
+                        # assignment. If it were assigned during `join_mass_shifted`, then
+                        # it overlapped with that entity and should not be merged. Otherwise
+                        # construct a new match
+                        for hit in exclude_compositions[name]:
+                            if span_overlap(hit, chroma):
+                                exclude = True
+                                break
+                        else:
+                            if name in new_members:
+                                chroma_to_update = new_members[name]
+                            else:
+                                chroma_to_update = self.chromatogram_type(match)
+                                chroma_to_update.created_at = "reverse_adduction_search"
+                            chroma, _ = chroma.bisect_adduct(Unmodified)
+                            chroma_to_update = chroma_to_update.merge(chroma, adduct)
+                            chroma_to_update.created_at = "reverse_adduction_search"
+                            new_members[name] = chroma_to_update
+                            matched = True
                     else:
-                        chroma_to_update = self.chromatogram_type(match)
+                        if name in new_members:
+                            chroma_to_update = new_members[name]
+                        else:
+                            chroma_to_update = self.chromatogram_type(match)
+                            chroma_to_update.created_at = "reverse_adduction_search"
+                        chroma, _ = chroma.bisect_adduct(Unmodified)
+                        chroma_to_update = chroma_to_update.merge(chroma, adduct)
                         chroma_to_update.created_at = "reverse_adduction_search"
-                    chroma, _ = chroma.bisect_adduct(Unmodified)
-                    chroma_to_update = chroma_to_update.merge(chroma, adduct)
-                    chroma_to_update.created_at = "reverse_adduction_search"
-                    new_members[name] = chroma_to_update
-                    matched = True
+                        new_members[name] = chroma_to_update
+                        matched = True
             if not matched and not exclude:
                 unmatched.append(chroma)
         out = []
@@ -325,7 +277,7 @@ class ChromatogramMatcher(TaskBase):
             i += 1
         return ChromatogramFilter(out)
 
-    def join_common_identities(self, chromatograms):
+    def join_common_identities(self, chromatograms, delta_rt=0):
         chromatograms._build_key_map()
         key_map = chromatograms._key_map
         out = []
@@ -337,8 +289,13 @@ class ChromatogramMatcher(TaskBase):
             accumulated = []
             last = disjoint_set[0]
             for case in disjoint_set[1:]:
-                if last.overlaps_in_time(case):
-                    last = last._merge_missing_only(case)
+                if last.overlaps_in_time(case) or ((case.start_time - last.end_time) < delta_rt):
+                    merged = last._merge_missing_only(case)
+                    merged.used_as_adduct = list(last.used_as_adduct)
+                    for ua in case.used_as_adduct:
+                        if ua not in merged.used_as_adduct:
+                            merged.used_as_adduct.append(ua)
+                    last = merged
                     last.created_at = "join_common_identities"
                 else:
                     accumulated.append(last)
@@ -347,11 +304,11 @@ class ChromatogramMatcher(TaskBase):
             out.extend(accumulated)
         return ChromatogramFilter(out)
 
-    def process(self, chromatograms, adducts=None, mass_error_tolerance=1e-5):
+    def process(self, chromatograms, adducts=None, mass_error_tolerance=1e-5, delta_rt=0):
         if adducts is None:
             adducts = []
         matches = []
-        chromatograms = list(chromatograms)
+        chromatograms = ChromatogramFilter(chromatograms)
         self.log("Matching chromatograms")
         i = 0
         n = len(chromatograms)
@@ -361,11 +318,11 @@ class ChromatogramMatcher(TaskBase):
                 self.log("%0.2f%% chromatograms searched (%d/%d)" % (i * 100. / n, i, n))
             matches.extend(self.search(chro, mass_error_tolerance))
         matches = ChromatogramFilter(matches)
-        matches = self.join_common_identities(matches)
+        matches = self.join_common_identities(matches, delta_rt)
         matches = self.join_mass_shifted(matches, adducts, mass_error_tolerance)
         self.log("Handling Adducts")
         matches = self.reverse_adduct_search(matches, adducts, mass_error_tolerance)
-        matches = self.join_common_identities(matches)
+        matches = self.join_common_identities(matches, delta_rt)
         return matches
 
 
@@ -399,17 +356,18 @@ class NonSplittingChromatogramMatcher(ChromatogramMatcher):
 
 
 class ChromatogramEvaluator(TaskBase):
-    def __init__(self, scoring_model=None, network=None):
+    acceptance_threshold = 0.4
+
+    def __init__(self, scoring_model=None):
         if scoring_model is None:
             scoring_model = ChromatogramScorer()
         self.scoring_model = scoring_model
-        self.network = network
 
-    def evaluate(self, chromatograms, base_coef=0.8, support_coef=0.2, delta_rt=0.25,
-                 min_points=3, smooth=True):
+    def evaluate(self, chromatograms, delta_rt=0.25, min_points=3, smooth_overlap_rt=True,
+                 *args, **kwargs):
         filtered = ChromatogramFilter.process(
             chromatograms, delta_rt=delta_rt, min_points=min_points)
-        if smooth:
+        if smooth_overlap_rt:
             filtered = ChromatogramOverlapSmoother(filtered)
 
         solutions = []
@@ -421,35 +379,128 @@ class ChromatogramEvaluator(TaskBase):
             if i % 1000 == 0:
                 self.log("%0.2f%% chromatograms evaluated (%d/%d)" % (i * 100. / n, i, n))
             try:
-                solutions.append(ChromatogramSolution(case, scorer=self.scoring_model))
+                sol = self.evaluate_chromatogram(case)
+                if self.scoring_model.accept(sol):
+                    solutions.append(sol)
                 end = time.time()
                 # Report on anything that took more than 30 seconds to evaluate
                 if end - start > 30.0:
                     self.log("%r took a long time to evaluated (%0.2fs)" % (case, end - start))
             except (IndexError, ValueError):
                 continue
-        if base_coef != 1.0 and self.network is not None:
-            NetworkScoreDistributor(solutions, self.network).distribute(base_coef, support_coef)
         return ChromatogramFilter(solutions)
 
-    def score(self, chromatograms, base_coef=0.8, support_coef=0.2, delta_rt=0.25, min_points=3,
-              smooth=True, adducts=None):
+    def evaluate_chromatogram(self, chromatogram):
+        score_set = self.scoring_model.compute_scores(chromatogram)
+        score = score_set.product()
+        return ChromatogramSolution(
+            chromatogram, score, scorer=self.scoring_model,
+            score_set=score_set)
 
-        solutions = self.evaluate(chromatograms, base_coef, support_coef, delta_rt, min_points, smooth)
-
-        if adducts is not None and len(adducts):
-            hold = prune_bad_adduct_branches(ChromatogramFilter(solutions))
-            self.log("Re-evaluating after adduct pruning")
-            solutions = self.evaluate(hold, base_coef, support_coef, delta_rt)
-
+    def finalize_matches(self, solutions):
         solutions = ChromatogramFilter(sol for sol in solutions if sol.score > 1e-5)
         return solutions
 
-    def acceptance_filter(self, solutions, threshold=0.4):
+    def score(self, chromatograms, delta_rt=0.25, min_points=3, smooth_overlap_rt=True,
+              adducts=None, *args, **kwargs):
+
+        solutions = self.evaluate(
+            chromatograms, delta_rt, min_points, smooth_overlap_rt, *args, **kwargs)
+
+        if adducts is not None and len(adducts):
+            hold = self.prune_adducts(solutions)
+            self.log("Re-evaluating after adduct pruning")
+            solutions = self.evaluate(hold, delta_rt, min_points, smooth_overlap_rt,
+                                      *args, **kwargs)
+
+        solutions = self.finalize_matches(solutions)
+        return solutions
+
+    def prune_adducts(self, solutions):
+        return prune_bad_adduct_branches(ChromatogramFilter(solutions))
+
+    def acceptance_filter(self, solutions, threshold=None):
+        if threshold is None:
+            threshold = self.acceptance_threshold
         return ChromatogramFilter([
             sol for sol in solutions
             if sol.score >= threshold and not sol.used_as_adduct
         ])
+
+    def update_parameters(self, param_dict):
+        param_dict['scoring_model'] = self.scoring_model
+
+
+class LogitSumChromatogramEvaluator(ChromatogramEvaluator):
+    acceptance_threshold = 4
+
+    def __init__(self, scorer):
+        super(LogitSumChromatogramEvaluator, self).__init__(scorer)
+
+    def prune_adducts(self, solutions):
+        return prune_bad_adduct_branches(ChromatogramFilter(solutions), score_margin=1.5)
+
+    def evaluate_chromatogram(self, chromatogram):
+        score_set = self.scoring_model.compute_scores(chromatogram)
+        logitsum_score = score_set.logitsum()
+        return ChromatogramSolution(
+            chromatogram, logitsum_score, scorer=self.scoring_model,
+            score_set=score_set)
+
+
+class LaplacianRegularizedChromatogramEvaluator(LogitSumChromatogramEvaluator):
+    def __init__(self, scorer, network, smoothing_factor=None, grid_smoothing_max=1.0,
+                 regularization_model=None):
+        super(LaplacianRegularizedChromatogramEvaluator,
+              self).__init__(scorer)
+        self.network = network
+        self.smoothing_factor = smoothing_factor
+        self.grid_smoothing_max = grid_smoothing_max
+        self.regularization_model = regularization_model
+
+    def evaluate(self, chromatograms, delta_rt=0.25, min_points=3, smooth_overlap_rt=True,
+                 *args, **kwargs):
+        solutions = super(LaplacianRegularizedChromatogramEvaluator, self).evaluate(
+            chromatograms, delta_rt=delta_rt, min_points=min_points,
+            smooth_overlap_rt=smooth_overlap_rt, *args, **kwargs)
+        self.log("... Applying Network Smoothing Regularization")
+        updated_network, search, params = smooth_network(
+            self.network, solutions, lmbda=self.smoothing_factor,
+            lambda_max=self.grid_smoothing_max,
+            model_state=self.regularization_model)
+        solutions = sorted(solutions, key=lambda x: x.score, reverse=True)
+        # TODO - Use aggregation across multiple observations for the same glycan composition
+        # instead of discarding all but the top scoring feature
+        seen = dict()
+        unannotated = []
+        for sol in solutions:
+            if sol.glycan_composition is None:
+                unannotated.append(sol)
+                continue
+            if sol.glycan_composition in seen:
+                continue
+            seen[sol.glycan_composition] = sol
+            node = updated_network[sol.glycan_composition]
+            if sol.score > self.acceptance_threshold:
+                sol.score = node.score
+            else:
+                # Do not permit network smoothing to boost scores below acceptance_threshold
+                if node.score < sol.score:
+                    sol.score = node.score
+        self.network_parameters = params
+        self.grid_search = search
+        display_table(
+            search.model.neighborhood_names,
+            np.array(params.tau).reshape((-1, 1)),
+            print_fn=lambda x: self.log("...... %s" % (x,)))
+        self.log("...... smoothing factor: %0.3f; threshold: %0.3f" % (
+            params.lmbda, params.threshold))
+        return ChromatogramFilter(list(seen.values()) + unannotated)
+
+    def update_parameters(self, param_dict):
+        super(LaplacianRegularizedChromatogramEvaluator, self).update_parameters(param_dict)
+        param_dict['network_parameters'] = self.network_parameters
+        param_dict['network_model'] = self.grid_search
 
 
 class ChromatogramExtractor(TaskBase):
@@ -485,7 +536,7 @@ class ChromatogramExtractor(TaskBase):
         return self.peak_loader.convert_scan_id_to_retention_time(scan_id)
 
     def load_peaks(self):
-        self.accumulated = self.peak_loader.ms1_peaks_above(self.minimum_mass)
+        self.accumulated = self.peak_loader.ms1_peaks_above(self.minimum_mass, self.minimum_intensity)
         self.annotated_peaks = [x[:2] for x in self.accumulated]
         self.peak_mapping = {x[:2]: x[2] for x in self.accumulated}
         self.minimum_intensity = np.percentile([p[1].intensity for p in self.accumulated], 5)
@@ -546,19 +597,18 @@ class ChromatogramProcessor(TaskBase):
     matcher_type = GlycanChromatogramMatcher
 
     def __init__(self, chromatograms, database, adducts=None, mass_error_tolerance=1e-5,
-                 scoring_model=None, network_sharing=0.,
-                 smooth=True, acceptance_threshold=0.4, delta_rt=0.25):
+                 scoring_model=None, smooth_overlap_rt=True, acceptance_threshold=0.4,
+                 delta_rt=0.25):
         if adducts is None:
             adducts = []
-        self._chromatograms = (chromatograms)
+        self._chromatograms = chromatograms
         self.database = database
         self.adducts = adducts
         self.mass_error_tolerance = mass_error_tolerance
+
         self.scoring_model = scoring_model
-        self.network = database.glycan_composition_network
-        self.base_coef = 1 - network_sharing
-        self.support_coef = network_sharing
-        self.smooth = smooth
+
+        self.smooth_overlap_rt = smooth_overlap_rt
         self.acceptance_threshold = acceptance_threshold
         self.delta_rt = delta_rt
 
@@ -569,33 +619,76 @@ class ChromatogramProcessor(TaskBase):
         matcher = self.matcher_type(self.database)
         return matcher
 
-    def match_compositions(self):
+    def _match_compositions(self):
         matcher = self.make_matcher()
-        matches = matcher.process(self._chromatograms, self.adducts, self.mass_error_tolerance)
+        matches = matcher.process(
+            self._chromatograms, self.adducts, self.mass_error_tolerance,
+            delta_rt=(self.delta_rt * 2 if self.smooth_overlap_rt else 0))
         return matches
 
     def make_evaluator(self):
-        evaluator = ChromatogramEvaluator(self.scoring_model, self.network)
+        evaluator = ChromatogramEvaluator(self.scoring_model)
         return evaluator
 
-    def run(self):
+    def match_compositions(self):
         self.log("Begin Matching Chromatograms")
-        matches = self.match_compositions()
+        matches = self._match_compositions()
         self.log("End Matching Chromatograms")
-        self.log("%d Matches Found" % (len(matches),))
+        self.log("%d Chromatogram Candidates Found" % (len(matches),))
+        return matches
+
+    def evaluate_chromatograms(self, matches):
         self.log("Begin Evaluating Chromatograms")
-        evaluator = self.make_evaluator()
-        self.solutions = evaluator.score(
-            matches, self.base_coef, self.support_coef,
-            smooth=self.smooth, adducts=self.adducts,
-            delta_rt=self.delta_rt)
-        self.accepted_solutions = evaluator.acceptance_filter(self.solutions)
+        self.evaluator = self.make_evaluator()
+        self.solutions = self.evaluator.score(
+            matches, smooth_overlap_rt=self.smooth_overlap_rt,
+            adducts=self.adducts, delta_rt=self.delta_rt)
+        self.accepted_solutions = self.evaluator.acceptance_filter(self.solutions)
         self.log("End Evaluating Chromatograms")
+
+    def run(self):
+        matches = self.match_compositions()
+        self.evaluate_chromatograms(matches)
 
     def __iter__(self):
         if self.accepted_solutions is None:
             self.run()
         return iter(self.accepted_solutions)
+
+
+class LogitSumChromatogramProcessor(ChromatogramProcessor):
+    def make_evaluator(self):
+        evaluator = LogitSumChromatogramEvaluator(self.scoring_model)
+        return evaluator
+
+
+class LaplacianRegularizedChromatogramProcessor(LogitSumChromatogramProcessor):
+    GRID_SEARCH = 'grid'
+
+    def __init__(self, chromatograms, database, adducts=None, mass_error_tolerance=1e-5,
+                 scoring_model=None, smooth_overlap_rt=True, acceptance_threshold=0.4,
+                 delta_rt=0.25, smoothing_factor=0.2, grid_smoothing_max=1.0,
+                 regularization_model=None):
+        super(LaplacianRegularizedChromatogramProcessor, self).__init__(
+            chromatograms, database, adducts, mass_error_tolerance,
+            scoring_model, smooth_overlap_rt, acceptance_threshold,
+            delta_rt)
+        if grid_smoothing_max is None:
+            grid_smoothing_max = 1.0
+        if self.GRID_SEARCH == smoothing_factor:
+            smoothing_factor = None
+        self.smoothing_factor = smoothing_factor
+        self.grid_smoothing_max = grid_smoothing_max
+        self.regularization_model = regularization_model
+
+    def make_evaluator(self):
+        evaluator = LaplacianRegularizedChromatogramEvaluator(
+            self.scoring_model,
+            self.database.glycan_composition_network,
+            smoothing_factor=self.smoothing_factor,
+            grid_smoothing_max=self.grid_smoothing_max,
+            regularization_model=self.regularization_model)
+        return evaluator
 
 
 class GlycopeptideChromatogramProcessor(ChromatogramProcessor):

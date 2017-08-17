@@ -36,6 +36,7 @@ def convert_to_peptide_dict(glycopeptide, id_tracker):
     }
 
     i = 0
+    # TODO: handle N-terminal and C-terminal modifications
     for pos, mods in glycopeptide:
         i += 1
         if not mods:
@@ -241,6 +242,7 @@ class MzIdentMLSerializer(task.TaskBase):
         self.log("Extracting Peptides")
         for gp in self.glycopeptide_list:
             d = convert_to_peptide_dict(gp.structure, self._id_tracker)
+
             if self._id_tracker(gp.structure) == gp.structure.id:
                 self._peptides.append(d)
                 seen.add(gp.structure.id)
@@ -260,13 +262,13 @@ class MzIdentMLSerializer(task.TaskBase):
         accepted_solution_ids = {gp.structure.id for gp in self.glycopeptide_list}
         for gp in self.glycopeptide_list:
             for solution in gp.spectrum_matches:
-                if solution.scan.id in seen_scans:
+                if solution.scan.scan_id in seen_scans:
                     continue
                 if solution.best_solution().q_value > self.q_value_threshold:
                     continue
                 if solution.score < self.ms2_score_threshold:
                     continue
-                seen_scans.add(solution.scan.id)
+                seen_scans.add(solution.scan.scan_id)
                 d = convert_to_spectrum_identification_dict(
                     solution, seen=accepted_solution_ids,
                     id_tracker=self._id_tracker)
@@ -350,7 +352,8 @@ class MzIdentMLSerializer(task.TaskBase):
             mods.append(pack_modification(mod, False))
         spec = {
             "enzymes": [
-                {"name": e, "missed_cleavages": hypothesis.parameters.get('max_missed_cleavages', None)}
+                {"name": getattr(e, 'name', e), "missed_cleavages": hypothesis.parameters.get(
+                    'max_missed_cleavages', None)}
                 for e in hypothesis.parameters.get('enzymes')
             ],
             "fragment_tolerance": (analysis.parameters['fragment_error_tolerance'] * 1e6, None, "parts per million"),

@@ -1,5 +1,7 @@
 from collections import OrderedDict
-from functools import partial
+from itertools import product
+
+import six
 
 import numpy as np
 
@@ -13,11 +15,28 @@ from ms_peak_picker import search
 from .base import ScoringFeatureBase, epsilon
 
 
-def linear_regression_residuals(x, y):
+MIN_POINTS = 5
+MAX_POINTS = 2000
+SIGMA_EPSILON = 1e-3
+
+
+def prepare_arrays_for_linear_fit(x, y):
     X = np.vstack((np.ones(len(x)), np.array(x))).T
     Y = np.array(y)
-    B = np.linalg.inv(X.T.dot(X)).dot(X.T.dot(Y))
-    Yhat = X.dot(B)
+    return X, Y
+
+
+def linear_regression_fit(x, y, prepare=False):
+    if prepare:
+        x, y = prepare_arrays_for_linear_fit(x, y)
+    B = np.linalg.inv(x.T.dot(x)).dot(x.T.dot(y))
+    Yhat = x.dot(B)
+    return Yhat
+
+
+def linear_regression_residuals(x, y):
+    X, Y = prepare_arrays_for_linear_fit(x, y)
+    Yhat = linear_regression_fit(X, Y)
     return (Y - Yhat) ** 2
 
 
@@ -31,59 +50,65 @@ class PeakShapeModelBase(object):
     def __repr__(self):
         return "{self.__class__.__name__}()".format(self=self)
 
+    @classmethod
+    def nargs(self):
+        return six.get_function_code(self.shape).co_argcount - 1
 
-class ConstrainedParameter(object):
-    def __init__(self, name, minimum=-float('inf'), maximum=float('inf')):
-        self.name = name
-        self.minimum = minimum
-        self.maximum = maximum
-
-    def __repr__(self):
-        return "ConstrainedParameter(%s, [%0.2f, %0.2f])" % (
-            self.name, self.minimum, self.maximum)
-
-    def clamp(self, value):
-        if value < self.minimum:
-            return self.minimum
-        elif value > self.maximum:
-            return self.maximum
-        else:
-            return value
-
-    def __call__(self, value):
-        return self.clamp(value)
+    @classmethod
+    def get_min_points(self):
+        return getattr(self, "min_points", self.nargs() + 1)
 
 
-class ParameterDict(dict):
-    def __missing__(self, key):
-        param = ConstrainedParameter(key)
-        self[key] = param
-        return param
+def gaussian_shape(xs, center, amplitude, sigma):
+    if sigma == 0:
+        sigma = SIGMA_EPSILON
+    norm = (amplitude) / (sigma * sqrt(2 * pi)) * \
+        exp(-((xs - center) ** 2) / (2 * sigma ** 2))
+    return norm
 
 
-class ConstrainedModel(object):
-    def __init__(self, model, param_spec=None):
-        if param_spec is None:
-            param_spec = ParameterDict()
-        self.model = model
-        self.param_spec = ParameterDict(param_spec)
+class GaussianModel(PeakShapeModelBase):
+    min_points = 6
 
-    def _fit(self, params, xs, ys, func=None):
-        if func is None:
-            func = self.model.fit
-        return leastsq(func, params, (xs, ys))[0]
+    @staticmethod
+    def fit(params, xs, ys):
+        center, amplitude, sigma = params
+        return ys - GaussianModel.shape(xs, center, amplitude, sigma)
 
-    def fit(self, params, xs, ys):
-        fit_params = self._fit(params, xs, ys)
-        params_dict = self.model.params_to_dict(fit_params)
-        fixed = dict()
-        for param_name, constraint in list(self.param_spec.items()):
-            estimated = params_dict[param_name]
-            revised = constraint.clamp(estimated)
-            if abs(revised - estimated) < 1e-3:
-                fixed[param_name] = revised
-        if fixed:
-            pass
+    @staticmethod
+    def shape(xs, center, amplitude, sigma):
+        return gaussian_shape(xs, center, amplitude, sigma)
+
+    @staticmethod
+    def guess(xs, ys):
+        center = np.average(xs, weights=ys / ys.sum())
+        height_at = np.abs(xs - center).argmin()
+        apex = ys[height_at]
+        sigma = np.abs(center - xs[[search.nearest_left(ys, apex / 2, height_at),
+                                    search.nearest_right(ys, apex / 2, height_at + 1)]]).sum()
+        return center, apex, sigma
+
+    @staticmethod
+    def params_to_dict(params):
+        center, amplitude, sigma = params
+        return OrderedDict((("center", center), ("amplitude", amplitude), ("sigma", sigma)))
+
+    @staticmethod
+    def center(params_dict):
+        return params_dict['center']
+
+    @staticmethod
+    def spread(params_dict):
+        return params_dict['sigma']
+
+
+def skewed_gaussian_shape(xs, center, amplitude, sigma, gamma):
+    if sigma == 0:
+        sigma = SIGMA_EPSILON
+    norm = (amplitude) / (sigma * sqrt(2 * pi)) * \
+        exp(-((xs - center) ** 2) / (2 * sigma ** 2))
+    skew = (1 + erf((gamma * (xs - center)) / (sigma * sqrt(2))))
+    return norm * skew
 
 
 class SkewedGaussianModel(PeakShapeModelBase):
@@ -110,10 +135,7 @@ class SkewedGaussianModel(PeakShapeModelBase):
 
     @staticmethod
     def shape(xs, center, amplitude, sigma, gamma):
-        norm = (amplitude) / (sigma * sqrt(2 * pi)) * \
-            exp(-((xs - center) ** 2) / (2 * sigma ** 2))
-        skew = (1 + erf((gamma * (xs - center)) / (sigma * sqrt(2))))
-        return norm * skew
+        return skewed_gaussian_shape(xs, center, amplitude, sigma, gamma)
 
     @staticmethod
     def center(params_dict):
@@ -133,6 +155,19 @@ class PenalizedSkewedGaussianModel(SkewedGaussianModel):
             center if center > xs[-1] or center < xs[0] else 1.)
 
 
+def bigaussian_shape(xs, center, amplitude, sigma_left, sigma_right):
+    if sigma_left == 0:
+        sigma_left = SIGMA_EPSILON
+    if sigma_right == 0:
+        sigma_right = SIGMA_EPSILON
+    ys = np.zeros_like(xs, dtype=np.float32)
+    left_mask = xs < center
+    ys[left_mask] = amplitude * np.exp(-(xs[left_mask] - center) ** 2 / (2 * sigma_left ** 2)) * sqrt(2 * pi)
+    right_mask = xs > center
+    ys[right_mask] = amplitude * np.exp(-(xs[right_mask] - center) ** 2 / (2 * sigma_right ** 2)) * sqrt(2 * pi)
+    return ys
+
+
 class BiGaussianModel(PeakShapeModelBase):
 
     @staticmethod
@@ -145,12 +180,7 @@ class BiGaussianModel(PeakShapeModelBase):
 
     @staticmethod
     def shape(xs, center, amplitude, sigma_left, sigma_right):
-        ys = np.zeros_like(xs, dtype=np.float32)
-        left_mask = xs < center
-        ys[left_mask] = amplitude * np.exp(-(xs[left_mask] - center) ** 2 / (2 * sigma_left ** 2)) * sqrt(2 * pi)
-        right_mask = xs > center
-        ys[right_mask] = amplitude * np.exp(-(xs[right_mask] - center) ** 2 / (2 * sigma_right ** 2)) * sqrt(2 * pi)
-        return ys
+        return bigaussian_shape(xs, center, amplitude, sigma_left, sigma_right)
 
     @staticmethod
     def fit(params, xs, ys):
@@ -223,15 +253,19 @@ class ChromatogramShapeFitterBase(ScoringFeatureBase):
         self.off_center = None
         self.shape_fitter = fitter
 
+    def is_invalid(self):
+        n = len(self.chromatogram)
+        return n < MIN_POINTS or n < self.shape_fitter.get_min_points()
+
     def handle_invalid(self):
-        self.line_test = 0.5
+        self.line_test = 1 - 5e-6
 
     def extract_arrays(self):
         self.xs, self.ys = self.chromatogram.as_arrays()
         if self.smooth:
             self.ys = gaussian_filter1d(self.ys, 1)
-        if len(self.xs) > 2000:
-            new_xs = np.linspace(self.xs.min(), self.xs.max(), 2000)
+        if len(self.xs) > MAX_POINTS:
+            new_xs = np.linspace(self.xs.min(), self.xs.max(), MAX_POINTS)
             new_ys = np.interp(new_xs, self.xs, self.ys)
             self.xs = new_xs
             self.ys = new_ys
@@ -241,24 +275,30 @@ class ChromatogramShapeFitterBase(ScoringFeatureBase):
         return NotImplemented
 
     def null_model_residuals(self):
-        residuals = flat_line_residuals(self.ys)
-        # residuals = linear_regression_residuals(self.xs, self.ys)
+        residuals = linear_regression_residuals(self.xs, self.ys)
         return residuals
 
     def perform_line_test(self):
         residuals = self.compute_residuals()
         line_test = (residuals ** 2).sum() / (
             (self.null_model_residuals()).sum())
-        self.line_test = line_test
+        self.line_test = max(line_test, 1e-5)
 
     def plot(self, ax=None):
         if ax is None:
             from matplotlib import pyplot as plt
             fig, ax = plt.subplots(1)
-        ax.plot(self.xs, self.ys, label='Observed')
-        ax.scatter(self.xs, self.ys, label='Observed')
-        ax.plot(self.xs, self.compute_fitted(), label='Fitted')
-        ax.plot(self.xs, self.compute_residuals(), label='Residuals')
+        ob1 = ax.plot(self.xs, self.ys, label='Observed')[0]
+        ob2 = ax.scatter(self.xs, self.ys, label='Observed')
+        f1 = ax.plot(self.xs, self.compute_fitted(), label='Fitted')[0]
+        r1 = ax.plot(self.xs, self.compute_residuals(), label='Residuals')[0]
+        ax.legend(
+            (
+                (ob1, ob2),
+                (f1,),
+                (r1,)
+            ), ("Observed", "Fitted", "Residuals")
+        )
         return ax
 
     @property
@@ -277,7 +317,7 @@ class ChromatogramShapeFitter(ChromatogramShapeFitterBase):
         self.params = None
         self.params_dict = None
 
-        if len(chromatogram) < 5:
+        if self.is_invalid():
             self.handle_invalid()
         else:
             self.extract_arrays()
@@ -364,12 +404,15 @@ class MultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
         self.params_list = []
         self.params_dict_list = []
 
-        if len(self.chromatogram) < 5:
+        if self.is_invalid():
             self.handle_invalid()
         else:
-            self.extract_arrays()
-            self.peak_shape_fit()
-            self.perform_line_test()
+            try:
+                self.extract_arrays()
+                self.peak_shape_fit()
+                self.perform_line_test()
+            except TypeError:
+                self.handle_invalid()
 
     @property
     def fit_parameters(self):
@@ -438,7 +481,7 @@ class MultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
 class AdaptiveMultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
     def __init__(self, chromatogram, max_peaks=5, smooth=True, fitters=None):
         if fitters is None:
-            fitters = (BiGaussianModel(), PenalizedSkewedGaussianModel(),)
+            fitters = (GaussianModel(), BiGaussianModel(), PenalizedSkewedGaussianModel(),)
         super(AdaptiveMultimodalChromatogramShapeFitter, self).__init__(
             chromatogram, smooth=smooth, fitter=fitters[0])
         self.max_peaks = max_peaks
@@ -449,22 +492,75 @@ class AdaptiveMultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
         self.alternative_fits = []
         self.best_fit = None
 
-        if len(self.chromatogram) < 5:
+        if self.is_invalid():
             self.handle_invalid()
         else:
             self.extract_arrays()
             self.peak_shape_fit()
             self.perform_line_test()
 
+    def is_invalid(self):
+        return len(self.chromatogram) < MIN_POINTS
+
     @property
     def fit_parameters(self):
         return self.best_fit.fit_parameters
+
+    @property
+    def xs(self):
+        try:
+            return self.best_fit.xs
+        except AttributeError:
+            return self._xs
+
+    @xs.setter
+    def xs(self, value):
+        self._xs = value
+
+    @property
+    def ys(self):
+        try:
+            return self.best_fit.ys
+        except AttributeError:
+            return self._ys
+
+    @ys.setter
+    def ys(self, value):
+        self._ys = value
 
     def compute_fitted(self):
         return self.best_fit.compute_fitted()
 
     def compute_residuals(self):
         return self.best_fit.compute_residuals()
+
+    def _get_gap_size(self):
+        return np.average(self.xs[1:] - self.xs[:-1],
+                          weights=(self.ys[1:] + self.ys[:-1])) * 2
+
+    def has_sparse_tails(self):
+        gap = self._get_gap_size()
+        partition = [False, False]
+        if self.xs[1] - self.xs[0] > gap:
+            partition[0] = True
+        if self.xs[-1] - self.xs[-2] > gap:
+            partition[1] = True
+        return partition
+
+    def generate_trimmed_chromatogram_slices(self):
+        for tails in set(product(*zip(self.has_sparse_tails(), [False, False]))):
+            if not tails[0] and not tails[1]:
+                continue
+            if tails[0]:
+                slice_start = self.xs[1]
+            else:
+                slice_start = self.xs[0]
+            if tails[1]:
+                slice_end = self.xs[-2]
+            else:
+                slice_end = self.xs[-1]
+            subset = self.chromatogram.slice(slice_start, slice_end)
+            yield subset
 
     def peak_shape_fit(self):
         for fitter in self.fitters:
@@ -474,13 +570,23 @@ class AdaptiveMultimodalChromatogramShapeFitter(ChromatogramShapeFitterBase):
             model_fit = MultimodalChromatogramShapeFitter(
                 self.chromatogram, self.max_peaks, self.smooth, fitter=fitter)
             self.alternative_fits.append(model_fit)
-        self.best_fit = min(self.alternative_fits, key=lambda x: x.line_test)
+            for subset in self.generate_trimmed_chromatogram_slices():
+                model_fit = ProfileSplittingMultimodalChromatogramShapeFitter(
+                    subset, self.max_peaks,
+                    self.smooth, fitter=fitter)
+                self.alternative_fits.append(model_fit)
+        ix = np.nanargmin([f.line_test for f in self.alternative_fits])
+        # self.best_fit = min(self.alternative_fits, key=lambda x: x.line_test)
+        self.best_fit = self.alternative_fits[ix]
         self.params_list = self.best_fit.params_list
         self.params_dict_list = self.best_fit.params_dict_list
         self.shape_fitter = self.best_fit.shape_fitter
 
     def perform_line_test(self):
         self.line_test = self.best_fit.line_test
+
+    def plot(self, *args, **kwargs):
+        return self.best_fit.plot(*args, **kwargs)
 
     def iterfits(self):
         xs = self.xs
@@ -518,7 +624,7 @@ class ProfileSplittingMultimodalChromatogramShapeFitter(ChromatogramShapeFitterB
         self.params_dict_list = []
         self.partition_sites = []
 
-        if len(self.chromatogram) < 5:
+        if self.is_invalid():
             self.handle_invalid()
         else:
             self.extract_arrays()
@@ -568,11 +674,15 @@ class ProfileSplittingMultimodalChromatogramShapeFitter(ChromatogramShapeFitterB
         for point in self.partition_sites:
             mask = (self.xs <= point.minimum_index) & (self.xs > last_x)
             if any(mask):
-                segments.append((self.xs[mask], self.ys[mask]))
+                xs, ys = self.xs[mask], self.ys[mask]
+                # if len(xs) > 1:
+                segments.append((xs, ys))
             last_x = point.minimum_index
         mask = self.xs > last_x
         if any(mask):
-            segments.append((self.xs[mask], self.ys[mask]))
+            xs, ys = self.xs[mask], self.ys[mask]
+            # if len(xs) > 1:
+            segments.append((xs, ys))
         return segments
 
     def set_up_peak_fit(self, xs, ys):
@@ -610,3 +720,16 @@ class ProfileSplittingMultimodalChromatogramShapeFitter(ChromatogramShapeFitterB
     def iterfits(self):
         for segment, params_dict in zip(self.build_partitions(), self.params_dict_list):
             yield self.shape_fitter.shape(segment[0], **params_dict)
+
+
+try:
+    _bigaussian_shape = bigaussian_shape
+    _skewed_gaussian_shape = skewed_gaussian_shape
+    _gaussian_shape = gaussian_shape
+
+    from ms_deisotope._c.feature_map.profile_transform import (
+        bigaussian_shape, skewed_gaussian_shape, gaussian_shape)
+
+    has_c = True
+except ImportError:
+    has_c = False

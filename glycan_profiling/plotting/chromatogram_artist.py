@@ -105,7 +105,7 @@ class ChromatogramArtist(ArtistBase):
     default_label_function = staticmethod(default_label_extractor)
     include_points = True
 
-    def __init__(self, chromatograms, ax=None, colorizer=None):
+    def __init__(self, chromatograms, ax=None, colorizer=None, label_peaks=True):
         if colorizer is None:
             colorizer = ColorCycler()
         if ax is None:
@@ -123,6 +123,7 @@ class ChromatogramArtist(ArtistBase):
         self.ax = ax
         self.default_colorizer = colorizer
         self.legend = None
+        self.label_peaks = label_peaks
 
     def _resolve_chromatograms_from_argument(self, chromatograms):
         try:
@@ -212,15 +213,25 @@ class ChromatogramArtist(ArtistBase):
             label_peak = True
         else:
             label, label_peak = label
+        label_peak = label_peak & self.label_peaks
 
         self.draw_group(label, rt, heights, color, label_peak, chromatogram, **kwargs)
 
+    def _interpolate_xticks(self, xlo, xhi):
+        self.ax.set_xlim(xlo - 0.02, xhi + 0.02)
+        span_time = xhi - xlo
+        tick_values = np.linspace(
+            xlo + min(0.05, 0.1 * span_time),
+            xhi - min(0.05, 0.1 * span_time),
+            6)
+        self.ax.set_xticks(tick_values)
+        self.ax.set_xticklabels(["%0.2f" % v for v in tick_values])
+
     def layout_axes(self, legend=True, axis_font_size=18, axis_label_font_size=24):
-        self.ax.set_xlim(self.minimum_ident_time - 0.02,
-                         self.maximum_ident_time + 0.02)
+        self._interpolate_xticks(self.minimum_ident_time, self.maximum_ident_time)
         self.ax.set_ylim(0, self.maximum_intensity * 1.25)
         if legend:
-            self.legend = self.ax.legend(bbox_to_anchor=(1.7, 1.), ncol=2, fontsize=10)
+            self.legend = self.ax.legend(bbox_to_anchor=(1.2, 1.), ncol=2, fontsize=10)
         self.ax.axes.spines['right'].set_visible(False)
         self.ax.axes.spines['top'].set_visible(False)
         self.ax.yaxis.tick_left()
@@ -252,8 +263,9 @@ class ChromatogramArtist(ArtistBase):
 
 
 class SmoothingChromatogramArtist(ChromatogramArtist):
-    def __init__(self, chromatograms, ax=None, colorizer=None, smoothing_factor=1.0):
-        super(SmoothingChromatogramArtist, self).__init__(chromatograms, ax=ax, colorizer=colorizer)
+    def __init__(self, chromatograms, ax=None, colorizer=None, smoothing_factor=1.0, label_peaks=True):
+        super(SmoothingChromatogramArtist, self).__init__(
+            chromatograms, ax=ax, colorizer=colorizer, label_peaks=label_peaks)
         self.smoothing_factor = smoothing_factor
 
     def draw_group(self, label, rt, heights, color, label_peak=True, chromatogram=None, label_font_size=10):

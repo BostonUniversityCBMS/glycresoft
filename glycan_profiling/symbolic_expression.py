@@ -579,6 +579,12 @@ class SymbolContext(SymbolSpace):
     def items(self):
         return self.context.items()
 
+    def keys(self):
+        return self.context.keys()
+
+    def values(self):
+        return self.context.values()
+
 
 class GlycanSymbolContext(SymbolContext):
     @staticmethod
@@ -592,7 +598,7 @@ class GlycanSymbolContext(SymbolContext):
                 key = _FMR.from_iupac_lite(text_key)
                 is_derivatized = composition_transform.has_derivatization(key)
                 if is_derivatized:
-                    key = glycan_composition.from_iupac_lite.strip_derivatization(text_key)
+                    key = str(glycan_composition.from_iupac_lite.strip_derivatization(text_key))
                 else:
                     key = text_key
             store[key] = value
@@ -601,7 +607,7 @@ class GlycanSymbolContext(SymbolContext):
     def serialize(self):
         form = "{%s}" % '; '.join("{}:{}".format(str(k), v) for k, v in sorted(
             self.items(), key=lambda x: _FMR.from_iupac_lite(
-                x[0]).mass()) if v > 0)
+                str(x[0])).mass()) if v > 0)
         return form
 
     @staticmethod

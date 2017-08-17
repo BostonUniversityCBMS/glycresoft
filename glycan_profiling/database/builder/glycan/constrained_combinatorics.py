@@ -1,3 +1,4 @@
+import re
 from itertools import product
 from collections import deque
 
@@ -107,6 +108,8 @@ class CombinatoricCompositionGenerator(object):
             passed = True
             combin = SymbolContext(combin)
             structure_classes = []
+            if sum(combin.values()) == 0:
+                continue
             for constraint in self.constraints:
                 if not constraint(combin):
                     passed = False
@@ -221,7 +224,7 @@ def parse_rules_from_file(path):
 
         if line.startswith(";"):
             continue
-        parts = line.replace("\n", "").split(" ")
+        parts = re.split(r"\s+", line.replace("\n", ""))
         try:
             if len(parts) == 3:
                 ranges.append(cast(parts))

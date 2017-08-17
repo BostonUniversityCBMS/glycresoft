@@ -12,11 +12,17 @@ from glycopeptidepy.io import fasta, uniprot
 from glycopeptidepy.structure.residue import UnknownAminoAcidException
 
 from .base import cli
+from .validators import RelativeMassErrorParam
+
 from glycan_profiling.serialize import (
     DatabaseBoundOperation, GlycanHypothesis, GlycopeptideHypothesis,
     SampleRun, Analysis)
+from glycan_profiling.database import (
+    GlycopeptideDiskBackedStructureDatabase,
+    GlycanCompositionDiskBackedStructureDatabase)
 
 from glycan_profiling.database.builder.glycopeptide.proteomics import mzid_proteome
+from glycan_profiling.database.builder.glycopeptide.proteomics.uniprot import UniprotProteinDownloader
 
 
 @cli.group("tools", short_help="Odds and ends to help inspect data and diagnose issues.")
@@ -224,12 +230,16 @@ def known_uniprot_glycoprotein(file_path=None, fasta_format=False):
         reader = fasta.ProteinFastaFileParser(handle)
 
         def name_getter(x):
-            return x.name
+            return x.name.accession
     else:
         reader = handle
 
         def name_getter(x):
-            return fasta.default_parser(x)
+            header = fasta.default_parser(x)
+            try:
+                return header.accession
+            except Exception:
+                return header[0]
 
     def checker_task(inqueue, outqueue, no_more_event):
         has_work = True
@@ -241,7 +251,7 @@ def known_uniprot_glycoprotein(file_path=None, fasta_format=False):
                     has_work = False
                 continue
             try:
-                if has_known_glycosylation(name_getter(protein).accession):
+                if has_known_glycosylation(name_getter(protein)):
                     outqueue.put(protein)
             except Exception as e:
                 print(e, protein, type(protein), protein)
@@ -288,3 +298,80 @@ def known_uniprot_glycoprotein(file_path=None, fasta_format=False):
         checker.join()
     checker_done.set()
     consumer.join()
+
+
+@tools.command("download-uniprot", short_help=(
+    "Downloads a list of proteins from UniProt"))
+@click.option("-i", "--name-file-path", help="Read input from a file instead of STDIN")
+@click.option("-o", "--output-path", help="Write output to a file instead of STDOUT")
+def download_uniprot(name_file_path=None, output_path=None):
+    if name_file_path is not None:
+        handle = open(name_file_path)
+    else:
+        handle = sys.stdin
+
+    def name_getter(x):
+        header = fasta.default_parser(x)
+        try:
+            return header.accession
+        except Exception:
+            return header[0]
+
+    accession_list = []
+    for line in handle:
+        accession_list.append(name_getter(line))
+    if output_path is None:
+        outhandle = sys.stdout
+    else:
+        outhandle = open(output_path, 'w')
+    writer = fasta.FastaFileWriter(outhandle)
+    downloader = UniprotProteinDownloader(accession_list, 10)
+    downloader.start()
+    has_work = True
+
+    def make_protein(accession, uniprot_protein):
+        sequence = uniprot_protein.sequence
+        name = "sp|{accession}|{gene_name} {description}".format(
+            accession=accession, gene_name=uniprot_protein.gene_name,
+            description=uniprot_protein.recommended_name)
+        return name, sequence
+
+    while has_work:
+        try:
+            accession, value = downloader.get(True, 3)
+            if isinstance(value, Exception):
+                click.echo("Could not retrieve %s - %r" % (accession, value), err=True)
+            else:
+                writer.write(*make_protein(accession, value))
+
+        except Empty:
+            # If we haven't completed the download process, block
+            # now and wait for the threads to join, then continue
+            # trying to fetch results
+            if not downloader.done_event.is_set():
+                downloader.join()
+                continue
+            # Otherwise we've already waited for all the results to
+            # arrive and we can stop iterating
+            else:
+                has_work = False
+
+
+@tools.command("mass-search")
+@click.option("-p", "--glycopeptide", is_flag=True)
+@click.option("-m", "--error-tolerance", type=RelativeMassErrorParam(), default=1e-5)
+@click.argument("database-connection")
+@click.argument("hypothesis-identifier")
+@click.argument("target-mass", type=float)
+def mass_search(database_connection, hypothesis_identifier, target_mass, glycopeptide=False, error_tolerance=1e-5):
+    if glycopeptide:
+        handle = GlycopeptideDiskBackedStructureDatabase(database_connection, int(hypothesis_identifier))
+    else:
+        handle = GlycanCompositionDiskBackedStructureDatabase(database_connection, int(hypothesis_identifier))
+    width = (target_mass * error_tolerance)
+    click.secho("Mass Window: %f-%f" % (target_mass - width, target_mass + width), fg='yellow')
+    hits = list(handle.search_mass_ppm(target_mass, error_tolerance))
+    if not hits:
+        click.secho("No Matches", fg='red')
+    for hit in hits:
+        click.echo("\t".join(map(str, hit)))

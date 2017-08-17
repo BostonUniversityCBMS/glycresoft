@@ -20,12 +20,6 @@ from glycopeptidepy import HashableGlycanComposition
 
 epsilon = 1e-6
 
-scores = namedtuple("scores", ["line_score", "isotopic_fit", "spacing_fit", "charge_count"])
-scores_adducted = namedtuple(
-    "scores_adducted",
-    ["line_score", "isotopic_fit", "spacing_fit", "charge_count",
-     "adduct_score"])
-
 
 def logit(x):
     return np.log(x) - np.log(1 - x)
@@ -45,6 +39,12 @@ def prod(*x):
 class ScorerBase(object):
     def __init__(self, *args, **kwargs):
         self.feature_set = OrderedDict()
+        self.configuration = dict()
+
+    def configure(self, analysis_info):
+        for feature in self.features():
+            config_data = feature.configure(analysis_info)
+            self.configuration[feature.get_feature_name()] = config_data
 
     def add_feature(self, scoring_feature):
         if scoring_feature is None:
@@ -67,6 +67,13 @@ class ScorerBase(object):
         score = reduce(mul, self.compute_scores(chromatogram), 1.0)
         return score
 
+    def accept(self, solution):
+        scored_features = solution.score_components()
+        for feature in self.features():
+            if feature.reject(scored_features):
+                return False
+        return True
+
 
 class ChromatogramScoreSet(object):
     def __init__(self, scores):
@@ -76,7 +83,7 @@ class ChromatogramScoreSet(object):
         return iter(self.scores.values())
 
     def __repr__(self):
-        return "%s(%s)" % (self.__class__.__name__, str(self.scores)[1:-1])
+        return "%s(%s)" % (self.__class__.__name__, str(dict(self.scores))[1:-1])
 
     def __getitem__(self, key):
         return self.scores[key]
@@ -216,11 +223,17 @@ class CompositionDispatchScorer(ScorerBase):
         model = self.find_model(composition)
         return model.compute_scores(chromatogram)
 
+    def accept(self, solution):
+        composition = self.get_composition(solution)
+        model = self.find_model(composition)
+        return model.accept(solution)        
+
 
 class ChromatogramSolution(object):
     _temp_score = 0.0
 
-    def __init__(self, chromatogram, score=None, scorer=ChromatogramScorer(), internal_score=None):
+    def __init__(self, chromatogram, score=None, scorer=ChromatogramScorer(), internal_score=None,
+                 score_set=None):
         if internal_score is None:
             internal_score = score
         self.chromatogram = chromatogram
@@ -230,6 +243,8 @@ class ChromatogramSolution(object):
 
         if score is None:
             self.compute_score()
+
+        self.score_set = score_set
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, "chromatogram"), name)
@@ -247,7 +262,9 @@ class ChromatogramSolution(object):
             self.internal_score = self.score = 0.0
 
     def score_components(self):
-        return self.scorer.compute_scores(self.chromatogram)
+        if self.score_set is None:
+            self.score_set = self.scorer.compute_scores(self.chromatogram)
+        return self.score_set
 
     @property
     def logitscore(self):

@@ -7,7 +7,7 @@ import ms_deisotope
 import traceback
 
 from ms_deisotope.processor import (
-    ScanProcessor, MSFileLoader, ScanIntervalTree,
+    ScanProcessor, MSFileLoader,
     NoIsotopicClustersError)
 
 from ms_deisotope.feature_map.quick_index import index as build_scan_index
@@ -15,7 +15,10 @@ from ms_deisotope.feature_map.quick_index import index as build_scan_index
 from ms_deisotope.data_source.common import ProcessedScan
 
 import logging
-from .task import TaskBase, log_handle, CallInterval
+from glycan_profiling.task import (
+    TaskBase,
+    log_handle,
+    CallInterval)
 
 
 from multiprocessing import Process, Queue
@@ -72,14 +75,15 @@ class ScanIDYieldingProcess(Process):
             try:
                 scan, products = next(self.loader)
                 scan_id = scan.id
+
                 if not self.ignore_tandem_scans:
-                    self.queue.put((scan_id, [p.id for p in products]))
+                    self.queue.put((scan_id, [p.id for p in products], True))
                 else:
-                    self.queue.put((scan_id, []))
-                if scan_id == end_scan:
-                    break
+                    self.queue.put((scan_id, [p.id for p in products], False))
                 index += 1
                 count += 1
+                if scan_id == end_scan:
+                    break
             except StopIteration:
                 break
             except Exception as e:
@@ -88,7 +92,7 @@ class ScanIDYieldingProcess(Process):
 
         if self.no_more_event is not None:
             self.no_more_event.set()
-            log_handle.log("All Scan IDs have been dealt. %r finished." % self)
+            log_handle.log("All Scan IDs have been dealt. %d scan bunches." % (count,))
         else:
             self.queue.put(DONE)
 
@@ -187,14 +191,15 @@ class PeakPickingProcess(Process, ScanTransformMixin):
         has_input = True
         transformer = self.make_scan_transformer()
 
-        logger_to_silence = logging.getLogger("deconvolution_scan_processor")
-        logger_to_silence.propagate = False
-        logger_to_silence.addHandler(logging.NullHandler())
+        for logname in ["deconvolution", "deconvolution_scan_processor"]:
+            logger_to_silence = logging.getLogger(logname)
+            logger_to_silence.propagate = False
+            logger_to_silence.addHandler(logging.NullHandler())
 
         i = 0
         while has_input:
             try:
-                scan_id, product_scan_ids = self.input_queue.get(True, 10)
+                scan_id, product_scan_ids, process_msn = self.input_queue.get(True, 10)
             except QueueEmpty:
                 if self.no_more_event is not None and self.no_more_event.is_set():
                     has_input = False
@@ -228,7 +233,7 @@ class PeakPickingProcess(Process, ScanTransformMixin):
                 self.log_error(e, scan_id, scan, (product_scan_ids))
 
             for product_scan in product_scans:
-                if len(product_scan.arrays[0]) == 0:
+                if len(product_scan.arrays[0]) == 0 or not process_msn:
                     self.skip_scan(product_scan)
                     continue
                 try:
@@ -362,7 +367,7 @@ class ScanTransformingProcess(Process, ScanTransformMixin):
         i = 0
         while has_input:
             try:
-                scan_id, product_scan_ids = self.input_queue.get(True, 10)
+                scan_id, product_scan_ids, process_msn = self.input_queue.get(True, 10)
             except QueueEmpty:
                 if self.no_more_event is not None and self.no_more_event.is_set():
                     has_input = False
@@ -397,7 +402,7 @@ class ScanTransformingProcess(Process, ScanTransformMixin):
                 self.log_error(e, scan_id, scan, (product_scan_ids))
 
             for product_scan in product_scans:
-                if len(product_scan.arrays[0]) == 0:
+                if len(product_scan.arrays[0]) == 0 or (not process_msn):
                     self.skip_scan(product_scan)
                     continue
                 try:
@@ -747,6 +752,20 @@ class ScanGenerator(TaskBase, ScanGeneratorBase):
             for helper in self._deconv_helpers:
                 helper.terminate()
 
+    def _preindex_file(self):
+        reader = MSFileLoader(self.ms_file, use_index=False)
+        try:
+            reader.prebuild_byte_offset_file(self.ms_file)
+        except AttributeError:
+            # the type does not support this type of indexing
+            pass
+        except IOError:
+            # the file could not be written
+            pass
+        except Exception as e:
+            # something else went wrong
+            self.error("An error occurred while pre-indexing.", e)
+
     def _make_interval_tree(self, start_scan, end_scan):
         reader = MSFileLoader(self.ms_file)
         start_ix = reader.get_scan_by_id(start_scan).index
@@ -784,6 +803,8 @@ class ScanGenerator(TaskBase, ScanGeneratorBase):
             # Not all platforms permit limiting the size of queues
             self._input_queue = Queue()
             self._output_queue = Queue()
+
+        self._preindex_file()
 
         if self.extract_only_tandem_envelopes:
             self.log("Constructing Scan Interval Tree")
