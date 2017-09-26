@@ -31,10 +31,16 @@ def fetch_scans_used_in_chromatogram(chromatogram_set, extractor):
     scan_ids = set()
     for chroma in chromatogram_set:
         scan_ids.update(chroma.scan_ids)
+
+        tandem_solutions = getattr(chroma, "tandem_solutions", [])
+        for tsm in tandem_solutions:
+            scan_ids.add(tsm.scan.id)
+            scan_ids.add(tsm.scan.precursor_information.precursor_scan_id)
+
     scans = []
     for scan_id in scan_ids:
         scans.append(extractor.get_scan_header_by_id(scan_id))
-    return sorted(scans, key=lambda x: x.index)
+    return sorted(scans, key=lambda x: (x.ms_level, x.index))
 
 
 def fetch_glycan_compositions_from_chromatograms(chromatogram_set, glycan_db):
@@ -51,12 +57,19 @@ def fetch_glycan_compositions_from_chromatograms(chromatogram_set, glycan_db):
 
 def update_glycan_chromatogram_composition_ids(hypothesis_migration, glycan_chromatograms):
     mapping = dict()
+    tandem_mapping = defaultdict(list)
     for chromatogram in glycan_chromatograms:
         if chromatogram.composition is None:
             continue
         mapping[chromatogram.composition.id] = chromatogram.composition
+        for match in getattr(chromatogram, 'tandem_solutions', []):
+            tandem_mapping[match.target.id].append(match.target)
+
     for key, value in mapping.items():
         value.id = hypothesis_migration.glycan_composition_id_map[value.id]
+    for key, group in tandem_mapping.items():
+        for value in group:
+            value.id = hypothesis_migration.glycan_composition_id_map[key]
 
 
 def update_glycopeptide_ids(hypothesis_migration, identified_glycopeptide_set):
@@ -311,6 +324,7 @@ class GlycanCompositionChromatogramAnalysisSerializer(AnalysisMigrationBase):
 
         n = len(self.chromatogram_set)
         i = 0
+
         for chroma in self.chromatogram_set:
             i += 1
             if i % 100 == 0:

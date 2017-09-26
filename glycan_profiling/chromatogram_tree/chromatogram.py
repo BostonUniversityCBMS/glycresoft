@@ -11,6 +11,7 @@ from glypy.composition.glycan_composition import HashableGlycanComposition
 
 
 from .mass_shift import Unmodified
+from .utils import ArithmeticMapping
 
 
 MIN_POINTS_FOR_CHARGE_STATE = 3
@@ -89,7 +90,21 @@ class SubsequenceMasker(object):
 mask_subsequence = SubsequenceMasker.mask_subsequence
 
 
-class Chromatogram(object):
+class _TimeIntervalMethods(object):
+    def overlaps_in_time(self, interval):
+        cond = ((self.start_time <= interval.start_time and self.end_time >= interval.end_time) or (
+            self.start_time >= interval.start_time and self.end_time <= interval.end_time) or (
+            self.start_time >= interval.start_time and self.end_time >= interval.end_time and
+            self.start_time <= interval.end_time) or (
+            self.start_time <= interval.start_time and self.end_time >= interval.start_time) or (
+            self.start_time <= interval.end_time and self.end_time >= interval.end_time))
+        return cond
+
+    def spans_time_point(self, point):
+        return self.start_time <= point <= self.end_time
+
+
+class Chromatogram(_TimeIntervalMethods):
     created_at = "new"
     glycan_composition = None
 
@@ -175,9 +190,9 @@ class Chromatogram(object):
         return total
 
     def adduct_signal_fractions(self):
-        return {
+        return ArithmeticMapping({
             k: self.total_signal_for(k) for k in self.adducts
-        }
+        })
 
     @property
     def integrated_abundance(self):
@@ -213,6 +228,13 @@ class Chromatogram(object):
             except KeyError:
                 self._infer_neutral_mass(self.adducts[0])
         return self._weighted_neutral_mass
+
+    @property
+    def theoretical_mass(self):
+        if self.composition:
+            return self.composition.total_composition().mass
+        else:
+            return self.weighted_neutral_mass
 
     def _infer_neutral_mass(self, node_type=Unmodified):
         prod = 0
@@ -464,15 +486,6 @@ class Chromatogram(object):
     def __hash__(self):
         return hash((self.neutral_mass, self.start_time, self.end_time))
 
-    def overlaps_in_time(self, interval):
-        cond = ((self.start_time <= interval.start_time and self.end_time >= interval.end_time) or (
-            self.start_time >= interval.start_time and self.end_time <= interval.end_time) or (
-            self.start_time >= interval.start_time and self.end_time >= interval.end_time and
-            self.start_time <= interval.end_time) or (
-            self.start_time <= interval.start_time and self.end_time >= interval.start_time) or (
-            self.start_time <= interval.end_time and self.end_time >= interval.end_time))
-        return cond
-
     @property
     def elemental_composition(self):
         return None
@@ -596,6 +609,12 @@ class ChromatogramTreeList(object):
 
     def __iter__(self):
         return iter(self.roots)
+
+    def __eq__(self, other):
+        return list(self) == list(other)
+
+    def __ne__(self, other):
+        return not (self == other)
 
     def clone(self):
         return ChromatogramTreeList(node.clone() for node in self)
@@ -804,7 +823,7 @@ class ChromatogramInterface(object):
 ChromatogramInterface.register(Chromatogram)
 
 
-class ChromatogramWrapper(object):
+class ChromatogramWrapper(_TimeIntervalMethods):
     def __init__(self, chromatogram):
         self.chromatogram = chromatogram
 
@@ -837,6 +856,10 @@ class ChromatogramWrapper(object):
     @property
     def weighted_neutral_mass(self):
         return self.chromatogram.weighted_neutral_mass
+
+    @property
+    def theoretical_mass(self):
+        return self.chromatogram.theoretical_mass
 
     @property
     def n_charge_states(self):

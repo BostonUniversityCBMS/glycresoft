@@ -2,12 +2,16 @@ import sys
 import cmd
 import csv
 import threading
+import code
 try:
     from Queue import Queue, Empty
 except ImportError:
     from queue import Queue, Empty
-import click
 
+import click
+import pkg_resources
+
+from glypy.composition.glycan_composition import HashableGlycanComposition
 from glycopeptidepy.io import fasta, uniprot
 from glycopeptidepy.structure.residue import UnknownAminoAcidException
 
@@ -25,7 +29,7 @@ from glycan_profiling.database.builder.glycopeptide.proteomics import mzid_prote
 from glycan_profiling.database.builder.glycopeptide.proteomics.uniprot import UniprotProteinDownloader
 
 
-@cli.group("tools", short_help="Odds and ends to help inspect data and diagnose issues.")
+@cli.group("tools", short_help="Odds and ends to help inspect data and diagnose issues")
 def tools():
     pass
 
@@ -199,6 +203,33 @@ def validate_fasta(path):
                 invalid_sequences.append((entry['name'], e))
     for name, error in invalid_sequences:
         click.secho("%s had %s" % (name, error), fg='yellow')
+
+
+@tools.command("validate-glycan-text", short_help="Validates a text file of glycan compositions")
+@click.argument("path")
+def validate_glycan_text(path):
+    from glycan_profiling.database.builder.glycan.glycan_source import TextFileGlycanCompositionLoader
+    with open(path, 'r') as handle:
+        loader = TextFileGlycanCompositionLoader(handle)
+        n = 0
+        glycan_classes = set()
+        residues = set()
+        unresolved = set()
+        for line in loader:
+            n += 1
+            glycan_classes.update(line[1])
+            glycan_composition = HashableGlycanComposition.parse(line[0])
+            for residue in glycan_composition.keys():
+                if residue.mass() == 0:
+                    unresolved.add(residue)
+                residues.add(residue)
+        click.secho("%d glycan compositions" % (n,))
+        click.secho("Residues:")
+        for residue in residues:
+            click.secho("\t%s - %f" % (str(residue), residue.mass()))
+        if unresolved:
+            click.secho("Unresolved Residues:", fg='yellow')
+            click.secho("\n".join(str(r) for r in unresolved), fg='yellow')
 
 
 def has_known_glycosylation(accession):
@@ -375,3 +406,46 @@ def mass_search(database_connection, hypothesis_identifier, target_mass, glycope
         click.secho("No Matches", fg='red')
     for hit in hits:
         click.echo("\t".join(map(str, hit)))
+
+
+@tools.command("version-check")
+def version_check():
+    packages = [
+        "glycan_profiling",
+        "glycresoft_app",
+        "glypy",
+        "glycopeptidepy",
+        "ms_peak_picker",
+        "brain-isotopic-distribution",
+        "ms_deisotope",
+        "pyteomics",
+        "lxml",
+        "numpy",
+        "scipy",
+        "matplotlib"
+    ]
+    click.secho("Library Versions", fg='yellow')
+    for dep in packages:
+        try:
+            rev = pkg_resources.require(dep)
+            click.echo(str(rev[0]))
+        except Exception:
+            try:
+                module = __import__(dep)
+            except ImportError:
+                continue
+            version =  getattr(module, "__version__", None)
+            if version is None:
+                version = getattr(module, "version", None)
+            if version is None:
+                try:
+                    module = __import__("%s.version" % dep).version
+                    version = module.version
+                except ImportError:
+                    continue
+            if version:
+                click.echo("%s %s" % (dep, version))
+
+@tools.command("interactive-shell")
+def interactive_shell():
+    code.interact()

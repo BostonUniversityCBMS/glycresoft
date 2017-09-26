@@ -15,10 +15,8 @@ install:
   - pip install lxml pyteomics brain-isotopic-distribution
   - pip install --only-binary=numpy,scipy numpy scipy
   - pip install -r external-requirements.txt
-  - pip install git+https://github.com/mobiusklein/glypy.git
-  - pip install git+https://github.com/mobiusklein/glycopeptidepy.git
-  - pip install git+https://github.com/mobiusklein/ms_peak_picker.git
-  - pip install git+https://github.com/mobiusklein/psims.git
-  - pip install git+https://github.com/mobiusklein/ms_deisotope.git
-  - pip install git+https://github.com/mobiusklein/pysqlite.git
-script: make test
+  - pip install psims
+  - python pyinstaller/install-from-git.py
+  - pip install PyInstaller
+  - python setup.py install
+script: make test build-pyinstaller

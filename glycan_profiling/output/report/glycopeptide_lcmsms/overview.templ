@@ -2,67 +2,83 @@
 <html>
 <head>
     <title></title>
+    <script type="text/javascript">
+        {% include "behaviors.js" %}
+    </script>
     <style>
-
-body {
-    font-family: sans-serif;
-}
-
-
-#lc-ms-overview img {
-    width: 50%;
-    margin-left: 24%;
-}
-
-#composition-abundance-overview img {
-    width: 50%;
-    margin-left: 24%;
-}
-
-.flex-container {
-    display: flex;
-    flex-direction: row;
-    flex-wrap: wrap;
-    flex-flow: row wrap;
-    align-content: flex-end;
-}
-
-.flex-justify {
-    justify-content: center;
-}
-
-.flex-left {
-    align-self: flex-start;
-}
-
-.flex-item {
-    flex: 1 0 0;
-    padding: 40px;
-}
-
-.display-table td {
-    text-align: center;
-}
-section {
-    border-bottom: 2px lightgray solid;
-    margin-bottom: 3px;
-    border-radius: 5px;
-}
-
-body {
-    margin: 20px;
-}
-
-</style>
+        {% include "style.css" %}
+    </style>
 </head>
 <body>
 <div>
+    <div id='display-panel'>
+        
+    </div>
     <h2>
         {{analysis.name}}
     </h2>
-    <section>
+    <section id='parameters' class='flex-container'>
+        <div class='flex-item flex-padding'>
+            <b>MS<sup>1</sup> Mass Accuracy:</b> {{analysis.parameters.mass_error_tolerance * (10 ** 6)}} PPM<br>
+            <b>Grouping Tolerance:</b> {{analysis.parameters.grouping_error_tolerance * (10 ** 6)}} PPM<br>
+            <b>MS<sup>n</sup> Mass Accuracy:</b> {{analysis.parameters.fragment_error_tolerance * (10 ** 6)}} PPM<br>
+            <b>Minimum <code>q</code>-Value For Clustering:</b> {{analysis.parameters.psm_fdr_threshold}}<br>
+        </div>
+        <div class='flex-item flex-padding'>
+            <b>Glycopeptide Hypothesis:</b>
+            <a>{{analysis.hypothesis.name}}</a><br>
+            <b>Sample Searched:</b>
+            <a>{{analysis.sample_run.name}}</a>
+        </div>
     </section>
-    <section>
+    <section id='protein-table-container' class='flex-container'>
+        <table>
+            <thead>
+                <tr>
+                    <th>
+                        Protein
+                    </th>
+                    <th>
+                        Matched Glycopeptides
+                    </th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in protein_index %}
+                    <tr class='protein-table-row' data-protein-id='{{row.protein_id}}'>
+                        <td>
+                            {{row.protein_name}}
+                        </td>
+                        <td>
+                            {{row.identified_glycopeptide_count}}
+                        </td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </section>
+    <section id='glycoprotein-detail-list'>
+        {% for glycoprotein in glycoprotein_iterator %}
+            <div class='glycoprotein-entry-detail' id='detail-glycoprotein-{{glycoprotein.id}}'>
+                <section>
+                {% include "protein-heading.templ" %}
+                <div class='glycoform-pileup-container'>
+                    {{renderer.draw_glycoforms(glycoprotein)}}
+                </div>
+                {% include "glycopeptide-table.templ" %}
+                <div class='flex-container'>
+                {% for site, axis in renderer.site_specific_abundance_plots(glycoprotein).items() %}
+                    <div class='flex-item'>
+                        {{axis|safe}}
+                    </div>
+                {% endfor %}
+                </div>
+                </section>
+                {% for glycopeptide in glycoprotein.identified_glycopeptides %}
+                    {% include "glycopeptide-detail-entry.templ" %}
+                {% endfor %}
+            </div>
+        {% endfor %}
     </section>
 </div>
 </body>

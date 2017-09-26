@@ -171,6 +171,23 @@ def weighted_laplacian_matrix(network):
     return weighted_degree_matrix(network) - weighted_adjacency_matrix(network)
 
 
+class GlycanCompositionSolutionRecord(object):
+    def __init__(self, glycan_composition, score, total_signal):
+        self.glycan_composition = glycan_composition
+        self.score = score
+        self.internal_score = self.score
+        self.total_signal = total_signal
+
+    @classmethod
+    def from_glycan_composition_chromatogram(cls, solution):
+        return cls(solution.glycan_composition, solution.score,
+                   solution.total_signal)
+
+    def __repr__(self):
+        return ("{self.__class__.__name__}({self.glycan_composition}, "
+                "{self.score}, {self.total_signal})").format(self=self)
+
+
 class BlockLaplacian(object):
     def __init__(self, network, threshold=0.0001, regularize=1.0):
         structure_matrix = weighted_laplacian_matrix(network)
@@ -920,11 +937,13 @@ class NetworkTrimmingSearchSolution(object):
         self.lambda_values = lambda_values
         self.press_residuals = press_residuals
         self.network = network
-        self.optimal_lambda = self.lambda_values[np.argmin(self.press_residuals)]
+        self.taus = taus
+        optimal_ix = np.argmin(self.press_residuals)
+        self.optimal_lambda = self.lambda_values[optimal_ix]
+        self.optimal_tau = self.taus[optimal_ix]
         self.minimum_residuals = self.press_residuals.min()
         self.observed = observed
         self.updated = updated
-        self.taus = taus
         self.model = model
 
     @property
@@ -1109,7 +1128,7 @@ class ThresholdSelectionGridSearch(object):
         for level in self.network_reduction:
             stack.append(np.array(level.taus).mean(axis=0))
             tau_magnitude.append(
-                np.abs(level.taus).sum() * (
+                np.abs(level.optimal_tau).sum() * (
                     (level.threshold / bias_scale) + bias_shift)
             )
         tau_magnitude = np.array(tau_magnitude)
@@ -1171,7 +1190,8 @@ class ThresholdSelectionGridSearch(object):
         lmbda_acc /= n
         A /= n
         # A = ProportionMatrixNormalization.normalize(A, self.model._belongingness_normalization)
-        return GridPointSolution(thresh_acc, lmbda_acc, tau_acc, A, self.model.neighborhood_names, self.model.node_names)
+        return GridPointSolution(thresh_acc, lmbda_acc, tau_acc, A,
+                                 self.model.neighborhood_names, self.model.node_names)
 
     def estimate_phi_observed(self, solution=None, remove_threshold=True, rho=DEFAULT_RHO):
         if solution is None:
@@ -1244,6 +1264,9 @@ class ThresholdSelectionGridSearch(object):
 def smooth_network(network, observed_compositions, threshold_step=0.5, apex_threshold=0.9,
                    belongingness_matrix=None, rho=DEFAULT_RHO, lambda_max=1,
                    include_missing=False, lmbda=None, model_state=None):
+    convert = GlycanCompositionSolutionRecord.from_glycan_composition_chromatogram
+    observed_compositions = [
+        convert(o) for o in observed_compositions if _has_glycan_composition(o)]
     model = GlycomeModel(
         observed_compositions, network,
         belongingness_matrix=belongingness_matrix)

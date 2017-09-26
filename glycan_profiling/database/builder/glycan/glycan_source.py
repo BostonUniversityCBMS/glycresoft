@@ -20,6 +20,26 @@ class TextFileGlycanCompositionLoader(object):
         self.file_object = file_object
         self.current_line = 0
 
+    def _partition_line(self, line):
+        n = len(line)
+        brace_close = line.index("}")
+        parts = []
+        # line is just glycan composition
+        if brace_close == n - 1:
+            parts.append(line)
+            return parts
+
+        offset = brace_close + 1
+        i = 0
+        while (offset + i) < n:
+            c = line[offset + i]
+            if c.isspace():
+                break
+            i += 1
+        parts.append(line[:offset + i])
+        parts.extend(t for t in re.split(r"(?:\t|\s{2,})", line[offset + i:]) if t)
+        return parts
+
     def _process_line(self):
         line = next(self.file_object)
         line = line.strip()
@@ -28,7 +48,7 @@ class TextFileGlycanCompositionLoader(object):
             while line == '':
                 line = next(self.file_object)
                 line = line.strip()
-            tokens = re.split(r"(?:\t|\s{2,})", line)
+            tokens = self._partition_line(line)
             if len(tokens) == 1:
                 composition, structure_classes = tokens[0], ()
             elif len(tokens) == 2:
@@ -41,7 +61,7 @@ class TextFileGlycanCompositionLoader(object):
         except StopIteration:
             raise
         except Exception as e:
-            raise Exception("Parsing Error %r occurred at %d" % (e, self.current_line))
+            raise Exception("Parsing Error %r occurred at line %d" % (e, self.current_line))
         return gc, structure_classes
 
     def __next__(self):
@@ -95,12 +115,15 @@ class GlycanClassLoader(object):
 
 named_reductions = {
     'reduced': 'H2',
-    'deuteroreduced': 'HH[2]'
+    'deuteroreduced': 'HH[2]',
+    '2ab': "C7H8N2",
+    '2aa': "C7H7NO"
 }
 
 
 named_derivatizations = {
-    "permethylated": "methyl"
+    "permethylated": "methyl",
+    "peracetylated": "acetyl"
 }
 
 
@@ -224,7 +247,11 @@ class GlycanCompositionHypothesisMerger(GlycanHypothesisSerializerBase):
         session = connection.session()
         for db_composition in session.query(DBGlycanComposition).filter(
                 DBGlycanComposition.hypothesis_id == hypothesis_id):
-            yield db_composition, [sc.name for sc in db_composition.structure_classes]
+            structure_classes = list(db_composition.structure_classes)
+            if len(structure_classes) > 0:
+                yield db_composition, [sc.name for sc in db_composition.structure_classes]
+            else:
+                yield db_composition, [None]
 
     def extract_iterative(self):
         for connection, hypothesis_id in self.source_hypothesis_ids:
@@ -236,7 +263,9 @@ class GlycanCompositionHypothesisMerger(GlycanHypothesisSerializerBase):
         acc = []
         seen = set()
         composition_cache = dict()
+        counter = 0
         for db_composition, structure_classes in self.extract_iterative():
+            counter += 1
             composition_string = db_composition.composition
             novel_combinations = set()
             for structure_class in structure_classes:
@@ -258,13 +287,15 @@ class GlycanCompositionHypothesisMerger(GlycanHypothesisSerializerBase):
                 composition_cache[composition_string] = inst
             for structure_class in novel_combinations:
                 seen.add((composition_string, structure_class))
+                if structure_class is None:
+                    continue
                 structure_class = structure_class_lookup[structure_class]
                 acc.append(dict(glycan_id=inst.id, class_id=structure_class.id))
                 if (len(acc) % 10000) == 0:
                     self.session.execute(GlycanCompositionToClass.insert(), acc)
                     acc = []
-            if acc:
-                self.session.execute(GlycanCompositionToClass.insert(), acc)
-                acc = []
-            self.session.commit()
+        if acc:
+            self.session.execute(GlycanCompositionToClass.insert(), acc)
+            acc = []
+        self.session.commit()
         assert len(seen) > 0

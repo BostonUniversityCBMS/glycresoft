@@ -2,13 +2,17 @@ from sqlalchemy import (
     Column, Numeric, Integer, String, ForeignKey, PickleType,
     Boolean, Table)
 from sqlalchemy.orm import relationship, backref
-from sqlalchemy.ext.associationproxy import association_proxy
-from sqlalchemy.orm.collections import attribute_mapped_collection
 from sqlalchemy.ext.declarative import declared_attr
 
 from .analysis import BoundToAnalysis
-from .chromatogram import ChromatogramSolution, ChromatogramWrapper
-from .tandem import GlycopeptideSpectrumCluster
+
+from .chromatogram import (
+    ChromatogramSolution,
+    ChromatogramWrapper)
+
+from .tandem import (
+    GlycopeptideSpectrumCluster)
+
 from .hypothesis import Glycopeptide
 
 from glycan_profiling.tandem.glycopeptide.identified_structure import (
@@ -17,7 +21,7 @@ from glycan_profiling.tandem.glycopeptide.identified_structure import (
 from glycan_profiling.tandem.chromatogram_mapping import TandemAnnotatedChromatogram
 from glycan_profiling.chromatogram_tree import GlycopeptideChromatogram
 
-from ms_deisotope.output.db import (
+from .base import (
     Base)
 
 
@@ -43,6 +47,14 @@ class IdentifiedStructure(BoundToAnalysis, ChromatogramWrapper):
             return self.chromatogram.total_signal
         except AttributeError:
             return 0
+
+    @property
+    def composition(self):
+        raise NotImplementedError()
+
+    @property
+    def entity(self):
+        raise NotImplementedError()
 
 
 class AmbiguousGlycopeptideGroup(Base, BoundToAnalysis):
@@ -135,6 +147,10 @@ class IdentifiedGlycopeptide(Base, IdentifiedStructure):
         session.flush()
         return inst
 
+    @property
+    def tandem_solutions(self):
+        return self.spectrum_cluster
+
     def get_chromatogram(self, *args, **kwargs):
         chromatogram = self.chromatogram.convert(*args, **kwargs)
         chromatogram.chromatogram = chromatogram.chromatogram.clone(GlycopeptideChromatogram)
@@ -166,6 +182,14 @@ class IdentifiedGlycopeptide(Base, IdentifiedStructure):
             inst = MemoryIdentifiedGlycopeptide(structure, spectrum_matches, chromatogram)
             inst.id = self.id
             return inst
+
+    @property
+    def composition(self):
+        return self.structure.convert()
+
+    @property
+    def entity(self):
+        return self.structure.convert()
 
     def __repr__(self):
         return "DB" + repr(self.convert())

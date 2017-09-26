@@ -8,85 +8,12 @@ try:
 except ImportError:
     from queue import Empty as QueueEmptyException
 
-from glypy.composition.glycan_composition import FrozenMonosaccharideResidue, Composition
 from ms_deisotope import DeconvolutedPeakSet
 
 from glycan_profiling.task import TaskBase
+from glycan_profiling.structure import (
+    ScanWrapperBase)
 from .ref import TargetReference, SpectrumReference
-
-
-class _mass_wrapper(object):
-
-    def __init__(self, mass, annotation=None):
-        self.value = mass
-        self.annotation = annotation if annotation is not None else mass
-
-    def mass(self, *args, **kwargs):
-        return self.value
-
-    def __repr__(self):
-        return "MassWrapper(%f, %s)" % (self.value, self.annotation)
-
-
-_hexnac = FrozenMonosaccharideResidue.from_iupac_lite("HexNAc")
-_hexose = FrozenMonosaccharideResidue.from_iupac_lite("Hex")
-_neuac = FrozenMonosaccharideResidue.from_iupac_lite('NeuAc')
-
-_standard_oxonium_ions = [
-    _hexnac,
-    _hexose,
-    _mass_wrapper(_hexose.mass() - Composition("H2O").mass),
-    _neuac,
-    _mass_wrapper(_neuac.mass() - Composition("H2O").mass),
-    FrozenMonosaccharideResidue.from_iupac_lite("Fuc"),
-    _mass_wrapper(_hexnac.mass() - Composition("C2H6O3").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("CH6O3").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("C2H4O2").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("H2O").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("H4O2").mass)
-]
-
-standard_oxonium_ions = _standard_oxonium_ions[:]
-
-_gscore_oxonium_ions = [
-    _hexnac,
-    _mass_wrapper(_hexnac.mass() - Composition("C2H6O3").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("CH6O3").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("C2H4O2").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("H2O").mass),
-    _mass_wrapper(_hexnac.mass() - Composition("H4O2").mass)
-]
-
-
-class OxoniumIonScanner(object):
-
-    def __init__(self, ions_to_search=None):
-        if ions_to_search is None:
-            ions_to_search = _standard_oxonium_ions
-        self.ions_to_search = ions_to_search
-
-    def scan(self, peak_list, charge=0, error_tolerance=2e-5):
-        matches = []
-        for ion in self.ions_to_search:
-            match = peak_list.has_peak(
-                ion.mass(charge=charge), error_tolerance)
-            if match is not None:
-                matches.append(match)
-        return matches
-
-    def ratio(self, peak_list, charge=0, error_tolerance=2e-5):
-        maximum = max(p.intensity for p in peak_list)
-        oxonium = sum(
-            p.intensity / maximum for p in self.scan(peak_list, charge, error_tolerance))
-        n = len(self.ions_to_search)
-        return oxonium / n
-
-    def __call__(self, peak_list, charge=0, error_tolerance=2e-5):
-        return self.ratio(peak_list, charge, error_tolerance)
-
-
-oxonium_detector = OxoniumIonScanner()
-gscore_scanner = OxoniumIonScanner(_gscore_oxonium_ions)
 
 
 def group_by_precursor_mass(scans, window_size=1.5e-5):
@@ -111,58 +38,6 @@ def group_by_precursor_mass(scans, window_size=1.5e-5):
         last_scan = scan
     groups.append(current_group)
     return groups
-
-
-class ScanStub(object):
-    """A stub for holding precursor information and
-    giving a Scan-like interface for accessing just that
-    information. Provides a serialized-like interface
-    which clients can use to load the real scan.
-
-    Attributes
-    ----------
-    id : str
-        The scan ID for the proxied scan
-    precursor_information : PrecursorInformation
-        The information describing the relevant
-        metadata for scheduling when and where this
-        scan should be processed, where actual loading
-        will occur.
-    bind : MzMLLoader
-        A resource to use to load scans with by scan id.
-    """
-    def __init__(self, precursor_information, bind):
-        self.id = precursor_information.product_scan_id
-        self.precursor_information = precursor_information
-        self.bind = bind
-
-    def convert(self, *args, **kwargs):
-        try:
-            return self.bind.get_scan_by_id(self.id)
-        except AttributeError:
-            raise KeyError(self.id)
-
-
-class ScanWrapperBase(object):
-    @property
-    def precursor_ion_mass(self):
-        self.requires_scan()
-        neutral_mass = self.scan.precursor_information.extracted_neutral_mass
-        return neutral_mass
-
-    @property
-    def scan_time(self):
-        self.requires_scan()
-        return self.scan.scan_time
-
-    @property
-    def precursor_information(self):
-        self.requires_scan()
-        return self.scan.precursor_information
-
-    def requires_scan(self):
-        if self.scan is None:
-            raise ValueError("%s is detatched from Scan" % (self.__class__.__name__))
 
 
 class SpectrumMatchBase(ScanWrapperBase):
@@ -281,7 +156,7 @@ class DeconvolutingSpectrumMatcherBase(SpectrumMatcherBase):
 
 class SpectrumMatch(SpectrumMatchBase):
 
-    __slots__ = ['scan', 'target', 'score', 'best_match', 'data_bundle', "q_value", 'id']
+    __slots__ = ['score', 'best_match', 'data_bundle', "q_value", 'id']
 
     def __init__(self, scan, target, score, best_match=False, data_bundle=None,
                  q_value=None, id=None):
@@ -515,8 +390,7 @@ class TandemClusterEvaluatorBase(TaskBase):
         scan_solution_map = defaultdict(list)
         self.log("... Searching Hits (%d:%d)" % (
             len(hit_to_scan),
-            sum(map(len, hit_to_scan.values()))
-            )
+            sum(map(len, hit_to_scan.values())))
         )
         i = 0
         n = len(hit_to_scan)
@@ -709,7 +583,7 @@ class IdentificationProcessDispatcher(TaskBase):
                              i * 100.0 / n))
             except Exception as e:
                 self.log("An exception occurred while feeding %r and %d scan ids: %r" % (hit_id, len(scan_ids), e))
-        self.log("...... Finished dealing %d work items" % (i,))
+        # self.log("...... Finished dealing %d work items" % (i,))
         self.done_event.set()
         return
 
@@ -775,8 +649,17 @@ class IdentificationProcessDispatcher(TaskBase):
                             self.log(
                                 "...... Too much time has elapsed with missing items. Breaking.")
                             has_work = False
+                else:
+                    strikes += 1
+                    if strikes % 50 == 0:
+                        self.log(
+                            "...... %d cycles without output (%d/%d, %0.2f%% Done)" % (
+                                strikes, len(seen), n, len(seen) * 100. / n))
                 continue
-            target.clear_caches()
+            try:
+                target.clear_caches()
+            except AttributeError:
+                pass
 
             j = 0
             for scan_id, score in score_map.items():
@@ -838,7 +721,10 @@ class SpectrumIdentificationWorkerBase(Process):
             self.solution_map[scan.id] = solution.score
             solution_target = solution.target
         if solution is not None:
-            solution.target.clear_caches()
+            try:
+                solution.target.clear_caches()
+            except AttributeError:
+                pass
         self.pack_output(solution_target)
 
     def task(self):
@@ -853,16 +739,6 @@ class SpectrumIdentificationWorkerBase(Process):
                     break
             items_handled += 1
             self.handle_item(structure, scan_ids)
-            # scans = [self.fetch_scan(i) for i in scan_ids]
-            # solution_target = None
-            # solution = None
-            # for scan in scans:
-            #     solution = self.evaluate(scan, structure, **self.evaluation_args)
-            #     self.solution_map[scan.id] = solution.score
-            #     solution_target = solution.target
-            # if solution is not None:
-            #     solution.target.clear_caches()
-            # self.pack_output(solution_target)
 
         self._work_complete.set()
         # self.log_handler("...... %s Finished. Handled %d items." % (self.name, items_handled))
