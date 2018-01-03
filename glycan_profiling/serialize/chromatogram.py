@@ -4,11 +4,12 @@ import numpy as np
 
 from sqlalchemy import (
     Column, Numeric, Integer, String, ForeignKey, PickleType,
-    Boolean, Table, func, select, join, alias)
+    Boolean, Table, func, select, join, alias, bindparam)
 from sqlalchemy.orm import relationship, backref, object_session
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.orm.collections import attribute_mapped_collection
 from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.ext import baked
 from sqlalchemy.exc import OperationalError
 
 from glycan_profiling.chromatogram_tree import (
@@ -34,6 +35,9 @@ from .base import (
 
 from glypy.composition.base import formula
 from glypy import Composition
+
+
+bakery = baked.bakery()
 
 
 def extract_key(obj):
@@ -65,6 +69,9 @@ class SimpleSerializerCacheBase(object):
             self.store[extract_key(db_obj)] = db_obj
             return db_obj
 
+    def __getitem__(self, obj):
+        return self.serialize(obj)
+
 
 class MassShift(Base):
     __tablename__ = "MassShift"
@@ -72,6 +79,8 @@ class MassShift(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(64), index=True, unique=True)
     composition = Column(String(128))
+
+    _hash = None
 
     def convert(self):
         return MemoryMassShift(str(self.name), Composition(str(self.composition)))
@@ -97,7 +106,9 @@ class MassShift(Base):
         return self.name == extract_key(other)
 
     def __hash__(self):
-        return hash(self.name)
+        if self._hash is None:
+            self._hash = hash(self.name)
+        return self._hash
 
 
 class CompoundMassShift(Base):
@@ -225,17 +236,54 @@ class ChromatogramTreeNode(Base, BoundToAnalysis):
             attribs.retention_time, scan_id, children, members,
             node_type)
 
+    def _get_child_nodes(self, session):
+        query = bakery(lambda session: session.query(ChromatogramTreeNode).join(
+            ChromatogramTreeNodeBranch.child).filter(
+            ChromatogramTreeNodeBranch.parent_id == bindparam("parent_id")))
+        result = query(session).params(parent_id=self.id).all()
+        return result
+
+    def _get_peaks(self, session):
+        query = bakery(lambda session: session.query(DeconvolutedPeak).join(
+            ChromatogramTreeNodeToDeconvolutedPeak).filter(
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == bindparam("node_id")))
+        result = query(session).params(node_id=self.id).all()
+        return result
+
     def convert(self, node_type_cache=None, scan_id_cache=None):
+        if scan_id_cache is not None:
+            try:
+                scan_id = scan_id_cache[self.scan_id]
+            except KeyError:
+                scan_id = self.scan.scan_id
+                scan_id_cache[self.scan_id] = scan_id
+        else:
+            scan_id = self.scan.scan_id
+        if node_type_cache is not None:
+            try:
+                node_type = node_type_cache[self.node_type_id]
+            except KeyError:
+                node_type = self.node_type.convert()
+                node_type_cache[self.node_type_id] = node_type
+        else:
+            node_type = self.node_type.convert()
+
+        session = object_session(self)
+        # children = self.children
+        children = self._get_child_nodes(session)
+        # peaks = self.members
+        peaks = self._get_peaks(session)
+
         inst = MemoryChromatogramTreeNode(
-            self.retention_time, self.scan.scan_id, [
-                child.convert() for child in self.children],
-            [p.convert() for p in self.members],
-            self.node_type.convert())
+            self.retention_time, scan_id, [
+                child.convert(node_type_cache, scan_id_cache) for child in children],
+            [p.convert() for p in peaks],
+            node_type)
         return inst
 
     @classmethod
-    def serialize(cls, obj, session, analysis_id, peak_lookup_table=None, mass_shift_cache=None, scan_lookup_table=None,
-                  node_peak_map=None, *args, **kwargs):
+    def serialize(cls, obj, session, analysis_id, peak_lookup_table=None, mass_shift_cache=None,
+                  scan_lookup_table=None, node_peak_map=None, *args, **kwargs):
         if mass_shift_cache is None:
             mass_shift_cache = MassShiftSerializer(session)
         inst = ChromatogramTreeNode(
@@ -378,8 +426,58 @@ class Chromatogram(Base, BoundToAnalysis):
         return node_types
 
     def get_chromatogram(self):
-        # return self.convert()
         return self
+
+    def _peaks_query(self, session):
+        anode = alias(ChromatogramTreeNode.__table__)
+        bnode = alias(ChromatogramTreeNode.__table__)
+        apeak = alias(DeconvolutedPeak.__table__)
+
+        peak_join = apeak.join(
+            ChromatogramTreeNodeToDeconvolutedPeak,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.peak_id == apeak.c.id)
+
+        root_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == anode.c.id)
+
+        branch_peaks_join = peak_join.join(
+            anode,
+            ChromatogramTreeNodeToDeconvolutedPeak.c.node_id == anode.c.id).join(
+            ChromatogramTreeNodeBranch,
+            ChromatogramTreeNodeBranch.child_id == anode.c.id).join(
+            bnode, ChromatogramTreeNodeBranch.parent_id == bnode.c.id).join(
+            ChromatogramToChromatogramTreeNode,
+            ChromatogramToChromatogramTreeNode.c.node_id == bnode.c.id)
+
+        branch_ids = select([apeak.c.id]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(branch_peaks_join)
+
+        root_ids = select([apeak.c.id]).where(
+            ChromatogramToChromatogramTreeNode.c.chromatogram_id == self.id
+        ).select_from(root_peaks_join)
+
+        all_ids = root_ids.union_all(branch_ids)
+        peaks = session.execute(all_ids).fetchall()
+        return {p[0] for p in peaks}
+
+    _peak_hash_ = None
+
+    def _build_peak_hash(self):
+        if self._peak_hash_ is None:
+            session = object_session(self)
+            self._peak_hash_ = frozenset(self._peaks_query(session))
+        return self._peak_hash_
+
+    @property
+    def _peak_hash(self):
+        return self._build_peak_hash()
+
+    def is_distinct(self, other):
+        return self._peak_hash.isdisjoint(other._peak_hash)
 
     @property
     def charge_states(self):
@@ -410,8 +508,10 @@ class Chromatogram(Base, BoundToAnalysis):
         inst = MemoryChromatogram(None, ChromatogramTreeList(nodes))
         return inst
 
-    def convert(self, node_type_cache=None, scan_id_cache=None):
-        return self.orm_convert(node_type_cache, scan_id_cache)
+    def convert(self, node_type_cache=None, scan_id_cache=None, **kwargs):
+        return self.orm_convert(
+            node_type_cache=node_type_cache,
+            scan_id_cache=scan_id_cache, **kwargs)
 
     @classmethod
     def serialize(cls, obj, session, analysis_id, peak_lookup_table=None, mass_shift_cache=None,
@@ -578,8 +678,21 @@ class ChromatogramWrapper(object):
         return self.chromatogram
 
     @property
+    def _peak_hash(self):
+        try:
+            return self._get_chromatogram()._peak_hash
+        except MissingChromatogramError:
+            return frozenset()
+
+    def is_distinct(self, other):
+        return self._peak_hash.isdisjoint(other._peak_hash)
+
+    @property
     def adducts(self):
-        return self._get_chromatogram().adducts
+        try:
+            return self._get_chromatogram().adducts
+        except MissingChromatogramError:
+            return []
 
     @property
     def weighted_neutral_mass(self):

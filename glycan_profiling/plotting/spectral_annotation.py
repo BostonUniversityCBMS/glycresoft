@@ -1,5 +1,5 @@
 import numpy as np
-from matplotlib import pyplot as plt
+from matplotlib import pyplot as plt, font_manager
 from ms_peak_picker.utils import draw_peaklist
 
 
@@ -13,6 +13,9 @@ default_ion_series_to_color = {
 }
 
 
+font_options = font_manager.FontProperties(family='sans serif')
+
+
 class SpectrumMatchAnnotator(object):
     def __init__(self, spectrum_match, ax=None):
         if ax is None:
@@ -21,7 +24,7 @@ class SpectrumMatchAnnotator(object):
         self.ax = ax
         self.upper = max(
             spectrum_match.spectrum, key=lambda x: x.intensity
-        ).intensity * 1.2
+        ).intensity * 1.35
 
     def draw_all_peaks(self, color='black', alpha=0.5, **kwargs):
         draw_peaklist(
@@ -43,10 +46,12 @@ class SpectrumMatchAnnotator(object):
 
         return self.ax.text(
             peak.mz, y, label, rotation=rotation, va='bottom',
-            ha='center', fontsize=fontsize)
+            ha='center', fontsize=fontsize, fontproperties=font_options,
+            clip_on=True)
 
     def format_axes(self):
         draw_peaklist([], self.ax, pretty=True)
+        self.ax.set_ylim(0, self.upper)
 
     def draw_matched_peaks(self, color='red', alpha=0.8, fontsize=12, ion_series_to_color=None, **kwargs):
         if ion_series_to_color is None:
@@ -87,7 +92,7 @@ class SpectrumMatchAnnotator(object):
             else:
                 label = str(label)
             self.ax.text(midx, midy, label, fontsize=fontsize,
-                         ha='center', va='bottom', rotation=rotation)
+                         ha='center', va='bottom', rotation=rotation, clip_on=True)
 
     def draw(self, **kwargs):
         fontsize = kwargs.pop('fontsize', 9)

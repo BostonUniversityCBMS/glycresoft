@@ -1,3 +1,4 @@
+import os
 import sys
 import traceback
 
@@ -22,10 +23,15 @@ def info(type, value, tb):
         ipdb.post_mortem(tb)
 
 
-# sys.excepthook = info
+sys.excepthook = info
 
 
-main = base.cli.main
-if __name__ == '__main__':
+def main():
     freeze_support()
+    if os.getenv("GLYCRESOFTDEBUG"):
+        sys.excepthook = info
+    base.cli.main(standalone_mode=True)
+
+
+if __name__ == '__main__':
     main()

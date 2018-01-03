@@ -7,28 +7,35 @@ import numpy as np
 from glypy.structure.fragment import Fragment
 from glypy.composition import Composition
 from glypy.composition.composition_transform import strip_derivatization
-from glypy.composition.glycan_composition import MonosaccharideResidue
+from glypy.structure.glycan_composition import MonosaccharideResidue
 from glypy.io.nomenclature.identity import is_a
 
 from glycan_profiling.structure import FragmentMatchMap
 from glycan_profiling.structure.fragment_match_map import SpectrumGraph
-from glycan_profiling.tandem.spectrum_matcher_base import SpectrumMatcherBase
+from glycan_profiling.tandem.spectrum_match import SpectrumMatcherBase
 
 from glycopeptidepy.utils.memoize import memoize
 
-fucose = MonosaccharideResidue.from_iupac_lite("Fuc")
+
+dhex = MonosaccharideResidue.from_iupac_lite("dHex")
 
 
 @memoize(100000000000)
-def is_fucose(residue):
-    return is_a(
-        strip_derivatization(residue.clone(
-            monosaccharide_type=MonosaccharideResidue)), fucose)
+def is_dhex(residue):
+    try:
+        return is_a(
+            strip_derivatization(residue.clone(
+                monosaccharide_type=MonosaccharideResidue)), dhex)
+    except TypeError:
+        if not isinstance(residue, MonosaccharideResidue):
+            return False
+        else:
+            raise
 
 
 class SignatureIonScorer(SpectrumMatcherBase):
-    def __init__(self, scan, glycan_composition):
-        super(SignatureIonScorer, self).__init__(scan, glycan_composition)
+    def __init__(self, scan, glycan_composition, mass_shift=None):
+        super(SignatureIonScorer, self).__init__(scan, glycan_composition, mass_shift)
         self.fragments_searched = 0
         self.fragments_matched = 0
         self.minimum_intensity_threshold = 0.01
@@ -57,7 +64,7 @@ class SignatureIonScorer(SpectrumMatcherBase):
         peak_set = self.spectrum
         pairs = SpectrumGraph()
 
-        blocks = [(part, part.mass()) for part in self.target if not is_fucose(part)]
+        blocks = [(part, part.mass()) for part in self.target if not is_dhex(part)]
         if include_compound:
             compound_blocks = list(itertools.combinations(self.target, 2))
             compound_blocks = [(block, sum(part.mass() for part in block))
@@ -95,8 +102,8 @@ class SignatureIonScorer(SpectrumMatcherBase):
             return matches
         # Simple oxonium ions
         for k in glycan_composition.keys():
-            # Fucose does not produce a reliable oxonium ion
-            if is_fucose(k):
+            # dhex does not produce a reliable oxonium ion
+            if is_dhex(k):
                 continue
             counter += 1
             f = Fragment('B', {}, [], k.mass(), name=str(k),

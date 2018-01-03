@@ -20,6 +20,7 @@ from glycan_profiling.profiler import (
 
 from glycan_profiling.tandem.glycopeptide.scoring import CoverageWeightedBinomialScorer
 from glycan_profiling.composition_distribution_model import GridPointSolution
+from glycan_profiling.database.composition_network import GraphReader
 
 from glycan_profiling.models import GeneralScorer
 from glycan_profiling.task import fmt_msg
@@ -97,13 +98,16 @@ def sample_path(fn):
 @click.option("-x", "--oxonium-threshold", default=0.05, type=float,
               help=('Minimum HexNAc-derived oxonium ion abundance '
                     'ratio to filter MS/MS scans. Defaults to 0.05.'))
+@click.option("-a", "--adduct", 'adducts', multiple=True, nargs=2,
+              help=("Adducts to consider. Specify name or formula, and a"
+                    " multiplicity."))
 @processes_option
 @click.option("--export", type=click.Choice(
               ['csv', 'html']), multiple=True,
               help="export command to after search is complete")
 @click.option("-o", "--output-path", default=None, type=click.Path(writable=True), help=(
               "Path to write resulting analysis to."))
-@click.option("-w", "--workload-size", default=1000, type=int, help="Number of spectra to process at once")
+@click.option("-w", "--workload-size", default=500, type=int, help="Number of spectra to process at once")
 @click.option("--save-intermediate-results", default=None, type=click.Path(), required=False,
               help='Save intermediate spectrum matches to a file', cls=HiddenOption)
 def search_glycopeptide(context, database_connection, sample_path, hypothesis_identifier,
@@ -111,7 +115,7 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
                         msn_mass_error_tolerance=2e-5, psm_fdr_threshold=0.05, peak_shape_scoring_model=None,
                         tandem_scoring_model=None, oxonium_threshold=0.15,
                         save_intermediate_results=None, processes=4,
-                        workload_size=1000, export=None):
+                        workload_size=500, adducts=None, export=None):
     """Identify glycopeptide sequences from processed LC-MS/MS data
     """
     if output_path is None:
@@ -134,6 +138,12 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
 
     tandem_scoring_model = validate_glycopeptide_tandem_scoring_function(
         context, tandem_scoring_model)
+
+    adducts = [validate_adduct(adduct, multiplicity)
+               for adduct, multiplicity in adducts]
+    expanded = []
+    expanded = MzMLGlycanChromatogramAnalyzer.expand_adducts(dict(adducts))
+    adducts = expanded
 
     if analysis_name is None:
         analysis_name = "%s @ %s" % (sample_run.name, hypothesis.name)
@@ -158,7 +168,8 @@ def search_glycopeptide(context, database_connection, sample_path, hypothesis_id
         tandem_scoring_model=tandem_scoring_model,
         oxonium_threshold=oxonium_threshold,
         n_processes=processes,
-        spectra_chunk_size=workload_size)
+        spectra_chunk_size=workload_size,
+        adducts=adducts)
     analyzer.display_header()
     gps, unassigned, target_hits, decoy_hits = analyzer.start()
     if save_intermediate_results is not None:
@@ -241,6 +252,9 @@ class RegularizationParameterType(click.ParamType):
 @click.option("-w", "--regularization-model-path", type=click.Path(exists=True),
               default=None,
               help="Path to a file containing neighborhood model for regularization")
+@click.option("-k", "--network-path", type=click.Path(exists=True), default=None,
+              help=("Path to a file containing the glycan composition network"
+                    " and neighborhood rules"))
 @click.option("-t", "--delta-rt", default=0.5, type=float,
               help='The maximum time between observed data points before splitting features')
 @click.option("--export", type=click.Choice(
@@ -254,6 +268,7 @@ def search_glycan(context, database_connection, sample_path,
                   analysis_name, adducts, grouping_error_tolerance=1.5e-5,
                   mass_error_tolerance=1e-5, minimum_mass=500.,
                   scoring_model=None, regularize=None, regularization_model_path=None,
+                  network_path=None,
                   output_path=None, scoring_model_features=None,
                   delta_rt=0.5, export=None, interact=False,
                   require_msms_signature=0.0, msn_mass_error_tolerance=2e-5,
@@ -275,6 +290,12 @@ def search_glycan(context, database_connection, sample_path,
             regularization_model = GridPointSolution.load(mod_file)
     else:
         regularization_model = None
+
+    if network_path is not None:
+        with open(network_path, 'r') as netfile:
+            network = GraphReader(netfile).network
+    else:
+        network = None
 
     database_connection = DatabaseBoundOperation(database_connection)
     ms_data = ProcessedMzMLDeserializer(sample_path, use_index=False)
@@ -313,6 +334,7 @@ def search_glycan(context, database_connection, sample_path,
         minimum_mass=minimum_mass,
         regularize=regularize,
         regularization_model=regularization_model,
+        network=network,
         analysis_name=analysis_name,
         delta_rt=delta_rt,
         require_msms_signature=require_msms_signature,

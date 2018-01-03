@@ -245,6 +245,8 @@ def validate_element(element):
 
 
 def parse_averagine_formula(formula):
+    if isinstance(formula, Averagine):
+        return formula
     return Averagine({k: float(v) for k, v in re.findall(r"([A-Z][a-z]*)([0-9\.]*)", formula)
                       if float(v or 0) > 0 and validate_element(k)})
 
@@ -260,6 +262,8 @@ averagines = {
 
 
 def validate_averagine(averagine_string):
+    if isinstance(averagine_string, Averagine):
+        return averagine_string
     if averagine_string in averagines:
         return averagines[averagine_string]
     else:
@@ -279,6 +283,16 @@ class AveragineParamType(click.types.StringParamType):
 
     def get_missing_message(self, param):
         return 'Choose from %s, or provide a formula.' % ', '.join(self.choices)
+
+
+class SubstituentParamType(click.types.StringParamType):
+    name = "SUBSTITUENT"
+
+    def convert(self, value, param, ctx):
+        t = Substituent(value)
+        if not t.composition:
+            raise ValueError("%s is not a recognized substituent" % value)
+        return t
 
 
 adducts = {

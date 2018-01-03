@@ -8,11 +8,6 @@ from glycan_profiling.chromatogram_tree import ChromatogramFilter
 
 from jinja2 import Markup, Template
 
-try:
-    from urllib import quote
-except ImportError:
-    from urllib.parse import quote
-
 
 from glycan_profiling.output.report.base import (
     svguri_plot, ReportCreatorBase)
@@ -120,7 +115,11 @@ class GlycanChromatogramReportCreator(ReportCreatorBase):
             filter(lambda x: x.score > self.threshold, gcs + und))
         lcms_plot, composition_abundance_plot = summary_plot.draw(min_score=5)
 
-        lcms_plot.ax.legend_.set_visible(False)
+        try:
+            lcms_plot.ax.legend_.set_visible(False)
+        except AttributeError:
+            # The legend may not have been created
+            pass
         lcms_plot.ax.set_title("Glycan Composition\nLC-MS Aggregated EICs", fontsize=24)
 
         fig = lcms_plot.ax.figure
